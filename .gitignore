@@ -1,0 +1,53 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.ipynb_checkpoints/
+
+# ---- 编译产物 (compiled extensions / build artifacts) ----
+build/
+dist/
+*.so
+*.o
+*.ninja
+*.ninja_log
+*.ninja_deps
+.ninja_deps
+.ninja_log
+
+# ---- 数据集 (datasets, 都是指向外部的软链接) ----
+/data/
+/models
+
+# ---- 训练结果 / 权重 (checkpoints & weights) ----
+ckpt*/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ---- 训练 / 推理输出 (training & inference outputs) ----
+/output/
+runs/
+runs_infer/
+wandb/
+*.log
+events.out.tfevents.*
+
+# ---- 预计算的中间数据 (precomputed intermediate data) ----
+*.npz
+*.npy
+predictions.json
+*_predictions.json
+moge_*.json
+
+# ---- 标注产出 (labeling outputs) ----
+flagged.json
+manual_normals.json
+
+# ---- 杂项 ----
+.DS_Store
+*.swp
+.vscode/
+.idea/

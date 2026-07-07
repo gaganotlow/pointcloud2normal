@@ -1,0 +1,21 @@
+name: point2normal
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - pyyaml
+  - scipy
+  - tqdm
+  - pillow
+  - pip
+  - pip:
+    - torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+    - torchvision --index-url https://download.pytorch.org/whl/cu124
+    - opencv-python
+    - flask
+    - trimesh
+    - ultralytics
+    - moge @ git+https://github.com/microsoft/MoGe.git

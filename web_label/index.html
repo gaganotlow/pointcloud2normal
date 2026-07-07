@@ -1,0 +1,270 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>cap-normal labeler</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e0e12;color:#ddd;font-family:sans-serif;overflow:hidden;
+    user-select:none;-webkit-user-select:none}
+  img{-webkit-user-drag:none;user-drag:none}
+  #c{display:block;width:100vw;height:calc(100vh - 56px)}
+  #bar{height:56px;display:flex;gap:6px;align-items:center;padding:0 8px;flex-wrap:wrap;background:#16161c}
+  button{padding:7px 10px;font-size:13px;background:#2a2a35;color:#eee;border:1px solid #444;border-radius:4px;cursor:pointer}
+  button:hover{background:#39394a}
+  #save{background:#2c7a2c;border-color:#3a3}
+  #imgs{position:absolute;right:10px;top:10px;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+  #src{max-height:46vh;max-width:46vw;border:2px solid #3a3;background:#000}
+  #photo{max-height:20vh;border:1px solid #393;background:#000}
+  #info{position:absolute;left:10px;top:10px;background:#000a;padding:8px 10px;font-size:13px;line-height:1.5;white-space:pre;user-select:text;-webkit-user-select:text;cursor:text}
+  #src,#photo{cursor:zoom-in}
+  #lightbox{position:fixed;inset:0;background:#000e;display:none;align-items:center;justify-content:center;z-index:100;cursor:zoom-out}
+  #lightbox img{max-width:97vw;max-height:97vh;image-rendering:auto}
+  #help{position:absolute;left:10px;bottom:64px;background:#000a;padding:6px 9px;font-size:12px;color:#aaa}
+  #loading{position:absolute;inset:0 0 56px 0;display:none;align-items:center;justify-content:center;z-index:90;pointer-events:none}
+  #loading div{background:#000c;color:#fff;padding:16px 26px;border-radius:10px;font-size:17px;border:1px solid #555}
+  #flag{background:#7a4a1a;border-color:#a63}
+  #leftbar{position:absolute;left:10px;top:102px;display:flex;flex-direction:column;gap:5px;z-index:5;width:172px}
+  #leftbar button{width:100%;text-align:left}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"/vendor/three.module.js",
+  "three/addons/controls/OrbitControls.js":"/vendor/OrbitControls.js",
+  "three/addons/controls/TransformControls.js":"/vendor/TransformControls.js"
+}}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="loading"><div>⏳ 加载点云中…</div></div>
+<div id="imgs"><img id="src" title="原图(绿框=内盖)— 双击放大"><img id="photo" title="内盖裁剪重建 — 双击放大"></div>
+<div id="lightbox"><img></div>
+<div id="info"></div>
+<div id="help">🔴规则(几何,可编辑) 🟠MSECNet 🟢MoGe深度图法向 | a/d上下张 | c=RGB视角 e=侧面 | 拖红环=改法向 | 蓝盘贴盖=准 | 方向键微调 | Ctrl+Z撤销 | r绕法向转 | 空格存 | x标异常</div>
+<div id="leftbar">
+  <button id="edge">视角→侧面 edge-on</button>
+  <button id="face">视角→正对盖面</button>
+  <button id="verify">🔄 验证:绕法向转 (r)</button>
+  <button id="snap">🎯 对齐🟢MoGe</button>
+  <button id="reset">重置法向=预标</button>
+  <button id="color">配色: RGB / 高度</button>
+  <button id="bigger">点大 +</button>
+  <button id="smaller">点小 −</button>
+  <button id="patch">取点: 局部块/整盖/0.5m</button>
+  <button id="rgbtoggle">隐藏/显示 RGB 图</button>
+</div>
+<div id="bar">
+  <button id="prev">◀ 上一个</button>
+  <button id="save">✔ 保存并下一个 (空格)</button>
+  <button id="skip">跳过 (s)</button>
+  <button id="flag">⚠ 标异常/搁置 (x)</button>
+  <span id="status"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {TransformControls} from 'three/addons/controls/TransformControls.js';
+
+const canvas=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+renderer.setPixelRatio(devicePixelRatio);
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0e0e12);
+const camera=new THREE.PerspectiveCamera(45,1,0.01,100); camera.position.set(0,0,2.2);
+let ptSize=0.012;   // default 2 notches smaller (0.02 /1.3 /1.3)
+let mode='sphere';  // 取点 默认: sphere(0.5m内全部点) | patch(局部盖面块) | whole(整盖)
+const MODES=['patch','whole','sphere'], MODENAME={patch:'局部盖面块',whole:'整盖',sphere:'0.5m内全部点'};
+let spinning=false;  // 'r' = spin cap around its normal axis; correct normal => no wobble
+const orbit=new OrbitControls(camera,renderer.domElement); orbit.target.set(0,0,0);
+scene.add(new THREE.AxesHelper(0.6));
+scene.add(new THREE.GridHelper(3,12,0x333344,0x222230));
+
+const pivot=new THREE.Object3D(); scene.add(pivot);
+const arrow=new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(0,0,0),1.4,0xff3344,0.25,0.13);
+pivot.add(arrow);   // RED = 规则(几何)预标注, 可编辑(拖红环改)
+const marrow=new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(0,0,0),1.5,0xff9900,0.26,0.14);
+scene.add(marrow);  // ORANGE = 模型(MSECNet)预测, 固定不可编辑
+const garrow=new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(0,0,0),1.55,0x33dd55,0.26,0.14);
+scene.add(garrow);  // GREEN = MoGe 深度图法向(零训练,独立估计)
+// plane-fit checker: a disc ALWAYS perpendicular to the candidate normal; if the normal is right it
+// sits flush on the cap face. Its own normal = pivot +Y = the candidate normal.
+const discMat=new THREE.MeshBasicMaterial({color:0x22ddff,transparent:true,opacity:0.33,side:THREE.DoubleSide,depthWrite:false});
+const discGroup=new THREE.Object3D(); pivot.add(discGroup);
+let discW=0.5, discH=0.32, discDir=null, discScale=1;   // rectangle ≈ knob OBB (w×h); discDir = OBB long axis on cap plane (GL)
+function buildDisc(){
+  while(discGroup.children.length){ const ch=discGroup.children.pop(); if(ch.geometry)ch.geometry.dispose(); discGroup.remove(ch); }
+  // RECTANGLE ≈ knob OBB; its plane ⟂ candidate normal, long axis aligned to the OBB direction projected
+  // onto the cap plane (so it really points along the knob — check the normal by flush fit of the plane).
+  const w=Math.max(0.04,discW*discScale), h=Math.max(0.04,discH*discScale);
+  const geo=new THREE.PlaneGeometry(w,h); geo.rotateX(-Math.PI/2);     // width along local +X, normal = pivot +Y
+  discGroup.add(new THREE.Mesh(geo,discMat));
+  discGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({color:0x00ffff})));
+  let ang=0;
+  if(discDir){                                                        // rotate local +X to the OBB direction
+    const n=getNormal();
+    const lx=new THREE.Vector3(1,0,0).applyQuaternion(pivot.quaternion);
+    const a=lx.clone().sub(n.clone().multiplyScalar(lx.dot(n))).normalize();
+    const b=discDir.clone().sub(n.clone().multiplyScalar(discDir.dot(n))).normalize();
+    ang=Math.atan2(new THREE.Vector3().crossVectors(a,b).dot(n), Math.max(-1,Math.min(1,a.dot(b))));
+  }
+  discGroup.rotation.set(0,ang,0);
+}
+buildDisc();
+function discResize(fac){ discScale=Math.max(0.25,Math.min(4,discScale*fac)); buildDisc(); }
+const undo=[];                       // Ctrl+Z history of pivot orientations
+function pushUndo(){ undo.push(pivot.quaternion.clone()); if(undo.length>200) undo.shift(); }
+const tcontrol=new TransformControls(camera,renderer.domElement);
+tcontrol.setMode('rotate'); tcontrol.setSize(0.95); tcontrol.setSpace('local'); tcontrol.attach(pivot); scene.add(tcontrol);
+tcontrol.addEventListener('dragging-changed',e=>{orbit.enabled=!e.value; if(e.value) pushUndo();});
+tcontrol.addEventListener('objectChange',updateInfo);
+
+let cloud=null, cur=null, idx=0, N=0, colorMode='rgb', rgbC=null, posA=null;
+
+function setNormal(n){
+  const v=new THREE.Vector3(n[0],n[1],n[2]).normalize();
+  pivot.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),v);
+}
+function getNormal(){ return new THREE.Vector3(0,1,0).applyQuaternion(pivot.quaternion).normalize(); }
+
+function applyColor(){
+  if(!cloud) return;
+  const col=cloud.geometry.getAttribute('color');
+  if(colorMode==='rgb'){ for(let i=0;i<rgbC.length;i++) col.array[i]=rgbC[i]; }
+  else{ // height along current normal -> rainbow (correct normal => flat cap => one color)
+    const n=getNormal(); let h=[],mn=1e9,mx=-1e9;
+    for(let i=0;i<posA.length;i+=3){ const d=posA[i]*n.x+posA[i+1]*n.y+posA[i+2]*n.z; h.push(d); if(d<mn)mn=d; if(d>mx)mx=d; }
+    for(let k=0;k<h.length;k++){ const t=(h[k]-mn)/(mx-mn+1e-9); const c=new THREE.Color().setHSL((1-t)*0.7,0.9,0.5); col.array[3*k]=c.r;col.array[3*k+1]=c.g;col.array[3*k+2]=c.b; }
+  }
+  col.needsUpdate=true;
+}
+function updateInfo(){
+  if(!cur) return; const n=getNormal();
+  const pre=new THREE.Vector3(...cur.prelabel).normalize();
+  const d=THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(n.dot(pre)))));
+  const mr=cur.model_label?THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(new THREE.Vector3(cur.model_label[0],cur.model_label[1],cur.model_label[2]).normalize().dot(pre))))):null;
+  const tierNames={clean:'干净',review:'复核',mid:'中档',rest:'无OBB',drop:'丢弃'};
+  document.getElementById('info').textContent=
+    `[${idx+1}/${N}] ${cur.file.slice(0,36)}  ${cur.is_saved?'(已标注)':''}${cur.flagged?'⚠'+cur.flagged:''}\n`+
+    `取点=${MODENAME[cur.mode]||cur.mode}  点数=${cur.npts}  内盖点=${cur.ninner}  档=${tierNames[cur.tier]||cur.tier||'-'}\n`+
+    `平面质量=${cur.quality!=null?cur.quality.toFixed(2):'-'}  🔴🟠模型↔规则=${mr!=null?mr.toFixed(0)+'°':'-'}\n`+
+    `法向 n=(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})  Δ预标=${d.toFixed(1)}°`;
+  // progress in bottom status bar
+  const pct=((idx+1)/N*100).toFixed(0);
+  const lbl=cur.labeled_count||0;
+  document.getElementById('status').textContent=`📋 ${idx+1}/${N} (${pct}%)  |  已标注: ${lbl}`;
+}
+async function load(i){
+  i=Math.max(0,Math.min(i,99999));
+  const ld=document.getElementById('loading'); ld.style.display='flex';
+  let buf;
+  try{ const r=await fetch('/api/cloud/'+i+'?mode='+mode); buf=await r.arrayBuffer(); }
+  finally{ ld.style.display='none'; }
+  const L=new DataView(buf).getUint32(0,true);                      // binary: [u32 hdrlen][JSON hdr][Float32 xyz,rgb]
+  cur=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,4,L)));
+  const f32=new Float32Array(buf,4+L), M=f32.length/6;
+  posA=new Float32Array(M*3); rgbC=new Float32Array(M*3);
+  for(let k=0;k<M;k++){ const a=6*k,b=3*k;
+    posA[b]=f32[a];posA[b+1]=f32[a+1];posA[b+2]=f32[a+2];
+    rgbC[b]=f32[a+3];rgbC[b+1]=f32[a+4];rgbC[b+2]=f32[a+5]; }
+  idx=cur.i; N=cur.n; undo.length=0;
+  if(cloud){scene.remove(cloud); cloud.geometry.dispose(); cloud.material.dispose();}
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(posA,3));
+  g.setAttribute('color',new THREE.BufferAttribute(rgbC.slice(),3));
+  cloud=new THREE.Points(g,new THREE.PointsMaterial({size:ptSize,vertexColors:true,sizeAttenuation:true}));
+  scene.add(cloud);
+  setNormal(cur.normal); applyColor();
+  if(cur.model_label){ marrow.visible=true; marrow.setDirection(new THREE.Vector3(cur.model_label[0],cur.model_label[1],cur.model_label[2]).normalize()); }
+  else marrow.visible=false;
+  if(cur.moge_label){ garrow.visible=true; garrow.setDirection(new THREE.Vector3(cur.moge_label[0],cur.moge_label[1],cur.moge_label[2]).normalize()); }
+  else garrow.visible=false;
+  if(cur.knob_rect){ discW=cur.knob_rect.w; discH=cur.knob_rect.h;
+    discDir=cur.knob_rect.dir?new THREE.Vector3(cur.knob_rect.dir[0],cur.knob_rect.dir[1],cur.knob_rect.dir[2]):null; }
+  else { discW=0.5; discH=0.32; discDir=null; }
+  discScale=1; buildDisc();
+  viewCamera();                                        // default: match the RGB photo viewpoint
+  document.getElementById('photo').src=cur.photo;
+  const si=document.getElementById('src');
+  if(cur.has_src){ si.style.display='block'; si.src='/api/srcimg/'+idx+'?t='+Date.now(); } else si.style.display='none';
+  updateInfo();
+}
+async function save(){
+  await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({file:cur.file,normal:getNormal().toArray()})});
+  load(idx+1);
+}
+function viewEdge(){ const n=getNormal(); let p=new THREE.Vector3().crossVectors(n,new THREE.Vector3(0,0,1));
+  if(p.length()<1e-3)p.set(1,0,0); p.normalize().multiplyScalar(3); camera.position.copy(p); orbit.target.set(0,0,0); orbit.update(); }
+function viewFace(){ const n=getNormal().multiplyScalar(2.3); camera.position.copy(n); orbit.target.set(0,0,0); orbit.update(); }   // along the normal
+function viewCamera(){   // match the RGB photo's viewpoint: look down the original camera +Z (GL-flipped) so cloud == photo
+  camera.position.set(0,0,2.3); camera.up.set(0,1,0); camera.lookAt(0,0,0); orbit.target.set(0,0,0); orbit.update(); }
+function verifyView(){   // edge-on side view (camera ⟂ normal) with WORLD up so orbit drag stays natural
+  const n=getNormal();
+  let dir=new THREE.Vector3().crossVectors(n,new THREE.Vector3(0,1,0));   // horizontal dir ⟂ normal
+  if(dir.length()<1e-3) dir.set(1,0,0);
+  dir.normalize().multiplyScalar(2.4);
+  camera.up.set(0,1,0);
+  camera.position.copy(dir); orbit.target.set(0,0,0); camera.lookAt(0,0,0); orbit.update();
+}
+function toggleSpin(){ spinning=!spinning; if(spinning) verifyView();
+  document.getElementById('verify').style.background=spinning?'#a33':'#2a2a35'; }
+
+document.getElementById('prev').onclick=()=>load(idx-1);
+document.getElementById('save').onclick=save;
+document.getElementById('skip').onclick=()=>load(idx+1);
+document.getElementById('edge').onclick=viewEdge;
+document.getElementById('face').onclick=viewFace;
+document.getElementById('verify').onclick=toggleSpin;
+document.getElementById('snap').onclick=()=>{if(!cur||!cur.moge_label)return;pushUndo();setNormal(cur.moge_label);applyColor();updateInfo();};
+document.getElementById('reset').onclick=()=>{pushUndo(); setNormal(cur.prelabel); applyColor(); updateInfo();};
+document.getElementById('color').onclick=()=>{colorMode=colorMode==='rgb'?'height':'rgb'; applyColor();};
+function setPt(s){ ptSize=Math.max(0.004,Math.min(0.08,s)); if(cloud) cloud.material.size=ptSize; }
+document.getElementById('bigger').onclick=()=>setPt(ptSize*1.3);
+document.getElementById('smaller').onclick=()=>setPt(ptSize/1.3);
+document.getElementById('patch').onclick=()=>{mode=MODES[(MODES.indexOf(mode)+1)%MODES.length]; load(idx);};
+async function flagBad(){ if(!cur) return;
+  await fetch('/api/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:cur.file,flag:'abnormal'})});
+  load(idx+1);
+}
+document.getElementById('flag').onclick=flagBad;
+document.getElementById('rgbtoggle').onclick=()=>{ const im=document.getElementById('imgs');
+  im.style.display = (im.style.display==='none'?'flex':'none'); };
+const lb=document.getElementById('lightbox'), lbimg=lb.querySelector('img');   // double-click photo => enlarge
+function showLB(s){ if(s){ lbimg.src=s; lb.style.display='flex'; } }
+lb.onclick=()=>lb.style.display='none';
+document.getElementById('src').ondblclick=function(){ showLB(this.src); };
+document.getElementById('photo').ondblclick=function(){ showLB(this.src); };
+addEventListener('keydown',e=>{
+  if(e.ctrlKey && (e.key==='z'||e.key==='Z')){ e.preventDefault();
+    if(undo.length){ pivot.quaternion.copy(undo.pop()); applyColor(); updateInfo(); } return; }
+  if(e.code==='Space'){e.preventDefault(); save(); return;}
+  if(e.key==='s'){load(idx+1); return;}
+  if(e.key==='a'){load(idx-1); return;}                  // 上一张
+  if(e.key==='d'){load(idx+1); return;}                  // 下一张
+  if(e.key==='x'){flagBad(); return;}                    // mark abnormal / 搁置
+  if(e.key==='r'){toggleSpin(); return;}                 // spin cap around its normal: no wobble = correct
+  if(e.key==='g'&&cur&&cur.moge_label){e.preventDefault();pushUndo();setNormal(cur.moge_label);applyColor();updateInfo();return;} // snap to MoGe
+  if(e.key==='e'){verifyView(); return;}                 // 侧面(edge-on)
+  if(e.key==='c'){viewCamera(); return;}                 // RGB 视角(默认)
+  if(e.key==='['){discResize(0.83); return;}             // plane-fit rectangle smaller/bigger
+  if(e.key===']'){discResize(1.2); return;}
+  const step=e.shiftKey?THREE.MathUtils.degToRad(0.1):THREE.MathUtils.degToRad(0.5); let ax=null;
+  if(e.key==='ArrowUp')ax=new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+  if(e.key==='ArrowDown')ax=new THREE.Vector3(-1,0,0).applyQuaternion(camera.quaternion);
+  if(e.key==='ArrowLeft')ax=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  if(e.key==='ArrowRight')ax=new THREE.Vector3(0,0,1).applyQuaternion(camera.quaternion);
+  if(ax){e.preventDefault(); pushUndo(); pivot.rotateOnWorldAxis(ax.normalize(),step); applyColor(); updateInfo();}
+});
+function resize(){ const w=innerWidth,h=innerHeight-56; renderer.setSize(w,h,false); camera.aspect=w/h;
+  camera.setViewOffset(w,h, Math.round(w*0.13),0, w,h);   // shift cloud ~13% left (RGB panels sit on the right)
+  camera.updateProjectionMatrix(); }
+addEventListener('resize',resize); resize();
+(function loop(){ requestAnimationFrame(loop);
+  if(spinning&&cloud){                                      // ORBIT the camera AROUND the predicted normal axis
+    const q=new THREE.Quaternion().setFromAxisAngle(getNormal(),0.02);
+    camera.position.applyQuaternion(q); camera.up.applyQuaternion(q); camera.lookAt(0,0,0);
+  } else orbit.update();
+  renderer.render(scene,camera); })();
+load(0);
+</script>
+</body>
+</html>
