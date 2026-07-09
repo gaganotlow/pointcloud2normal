@@ -21,18 +21,48 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
+
+def arg_value(name, default=""):
+    if name not in sys.argv:
+        return default
+    i = sys.argv.index(name)
+    if i + 1 >= len(sys.argv):
+        return default
+    return sys.argv[i + 1]
+
+
+def load_prediction_dict(path):
+    """Load either a batch prediction dict or one infer_pipeline output JSON."""
+    if not path or not os.path.exists(path):
+        return {}, None
+    data = json.load(open(path, encoding="utf-8"))
+    if isinstance(data, dict) and "normal" in data and "cloud_npz" in data:
+        key = os.path.basename(data["cloud_npz"])
+        pred = {
+            "normal": data["normal"],
+            "points": data.get("points"),
+            "point_source": data.get("point_source"),
+            "checkpoint_step": data.get("checkpoint_step"),
+            "checkpoint_mean_err": data.get("checkpoint_mean_err"),
+            "source_json": path,
+        }
+        return {key: pred}, key
+    return data, None
+
 # ---- paths ----
 PCD = os.path.join(ROOT, "data", "pcd_dataset_roi")
 SAVE = os.path.join(ROOT, "output", "manual_normals.json")
 LBL = os.path.join(ROOT, "shared", "normal_labels_full.npz")
 KCJSON = os.path.join(ROOT, "shared", "knob_centers.json")
 V3PATH = os.path.join(ROOT, "shared", "v3_predictions.json")
-MODELPATH = os.path.join(ROOT, "shared", "msecnet_predictions.json")
-PRODPATH = os.path.join(ROOT, "shared", "prod_predictions.json")
-MOGEPATH = os.path.join(ROOT, "shared", "moge_norm_predictions.json")
+MODELPATH = (arg_value("--pred-json") or os.environ.get(
+    "MSECNET_PRED_PATH", os.path.join(ROOT, "shared", "msecnet_predictions.json")
+))
+PRODPATH = os.environ.get("PROD_PRED_PATH", os.path.join(ROOT, "shared", "prod_predictions.json"))
+MOGEPATH = os.environ.get("MOGE_PRED_PATH", os.path.join(ROOT, "shared", "moge_norm_predictions.json"))
 AUDITPATH = os.path.join(ROOT, "shared", "data_audit.json")
 FLAG = os.path.join(ROOT, "output", "flagged.json")
-SRC_DIR = os.path.join(ROOT, "data", "yolo_seg_by_car")
+SRC_DIR = arg_value("--src-dir") or os.environ.get("SRC_DIR", os.path.join(ROOT, "data", "yolo_seg_by_car"))
 
 os.makedirs(os.path.join(ROOT, "output"), exist_ok=True)
 
@@ -54,7 +84,7 @@ NINNER = [int(_ni[k]) for k in order]
 V3 = json.load(open(V3PATH)) if os.path.exists(V3PATH) else {}
 # MODEL prelabel (orange) shown vs geometric (red)
 MODELPATH_USE = MODELPATH if os.path.exists(MODELPATH) else (PRODPATH if os.path.exists(PRODPATH) else None)
-PROD = json.load(open(MODELPATH_USE)) if MODELPATH_USE else {}
+PROD, SINGLE_PRED_FILE = load_prediction_dict(MODELPATH_USE) if MODELPATH_USE else ({}, None)
 if MODELPATH_USE:
     print(f"model prelabel source: {os.path.basename(MODELPATH_USE)} ({len(PROD)} preds)", flush=True)
 MOGE = json.load(open(MOGEPATH)) if os.path.exists(MOGEPATH) else {}
@@ -121,6 +151,23 @@ else:
         nb[t] = nb.get(t, 0) + 1
     print(f"RANSAC auto-filter: review={nb.get('review',0)} mid={nb.get('mid',0)} "
           f"clean={nb.get('clean',0)} DROPPED={nb.get('drop',0)} | labeling queue = {len(FILES)}", flush=True)
+
+FOCUS_FILE = (arg_value("--focus-file") or os.environ.get("FOCUS_FILE", "") or SINGLE_PRED_FILE or "").strip()
+if FOCUS_FILE:
+    focus_base = os.path.basename(FOCUS_FILE)
+    if not focus_base.endswith(".npz"):
+        focus_base += ".npz"
+    focus = [i for i, f in enumerate(FILES) if f == focus_base]
+    if focus:
+        i = focus[0]
+        FILES = [FILES[i]]
+        NORMS = [NORMS[i]]
+        CONF = [CONF[i]]
+        AGREE = [AGREE[i]]
+        NINNER = [NINNER[i]]
+        print(f"FOCUS_FILE enabled: {focus_base}", flush=True)
+    else:
+        print(f"WARNING: FOCUS_FILE not found in labeling queue: {focus_base}", flush=True)
 
 # index source images by basename
 SRC = {}
@@ -397,6 +444,6 @@ def save():
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8765
+    port = int(arg_value("--port", "8765"))
     print(f"serving {len(FILES)} clouds at http://0.0.0.0:{port}  (labels -> {SAVE})", flush=True)
     app.run(host="0.0.0.0", port=port, threaded=True)
