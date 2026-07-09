@@ -5,8 +5,11 @@
 Usage: python train_rgb_fusion.py <labels> <pcd_dir> <moge_feat_dir> [options]
 """
 import argparse
+import csv
+import glob
 import json
 import os
+import re
 import sys
 import time
 
@@ -21,10 +24,16 @@ ROOT = os.path.dirname(HERE)
 MROOT = os.path.join(HERE, "..", "msecnet", "MSECNet")
 sys.path.insert(0, os.path.join(MROOT, "model"))
 sys.path.insert(0, os.path.join(MROOT, "scripts"))
+POINTOPS_ROOT = os.path.join(MROOT, "scripts", "lib", "pointops")
+for path in glob.glob(os.path.join(POINTOPS_ROOT, "build", "lib.*")):
+    sys.path.insert(0, path)
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 from util import config
 from architectures import MSECNet
 import cap_patch
+
+
+RGB_MODES = ("full", "map", "cls")
 
 
 def rand_rot(rs, max_deg=180.0):
@@ -47,41 +56,339 @@ def project_features_to_points(xyz, feat_map, K_norm, w, h):
     Returns:
         point_feats: (N, C) 每个点对应的特征
     """
+    feat_map = np.asarray(feat_map, dtype=np.float32)
     C, feat_h, feat_w = feat_map.shape
     N = len(xyz)
-
-    # 3D点投影到图像坐标
-    xyz_homo = np.concatenate([xyz, np.ones((N, 1))], axis=1)  # (N, 4)
-    uv_homo = xyz_homo[:, :3] @ K_norm.T  # (N, 3)
-
-    # 归一化得到像素坐标
-    valid = uv_homo[:, 2] > 0
-    u = uv_homo[:, 0] / (uv_homo[:, 2] + 1e-9)
-    v = uv_homo[:, 1] / (uv_homo[:, 2] + 1e-9)
-
-    # 映射到特征图尺寸
-    u_feat = u * feat_w / w
-    v_feat = v * feat_h / h
-
-    # 双线性插值采样
-    u_feat = np.clip(u_feat, 0, feat_w - 1)
-    v_feat = np.clip(v_feat, 0, feat_h - 1)
-
-    # 简单最近邻采样（可优化为双线性插值）
-    u_idx = np.round(u_feat).astype(np.int32)
-    v_idx = np.round(v_feat).astype(np.int32)
-
     point_feats = np.zeros((N, C), dtype=np.float32)
-    point_feats[valid] = feat_map[:, v_idx[valid], u_idx[valid]].T
+    if N == 0:
+        return point_feats
 
-    return point_feats
+    xyz = np.asarray(xyz, dtype=np.float32)
+    K_norm = np.asarray(K_norm, dtype=np.float32)
+    z = xyz[:, 2]
+
+    # K_norm is normalized by image size in the cached MoGe outputs.
+    u = K_norm[0, 0] * float(w) * xyz[:, 0] / (z + 1e-9) + K_norm[0, 2] * float(w)
+    v = K_norm[1, 1] * float(h) * xyz[:, 1] / (z + 1e-9) + K_norm[1, 2] * float(h)
+    valid = (z > 1e-6) & np.isfinite(u) & np.isfinite(v) & (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)
+    if not np.any(valid):
+        return point_feats
+
+    scale_x = (feat_w - 1) / max(float(w - 1), 1.0)
+    scale_y = (feat_h - 1) / max(float(h - 1), 1.0)
+    uf = np.clip(u[valid] * scale_x, 0, feat_w - 1)
+    vf = np.clip(v[valid] * scale_y, 0, feat_h - 1)
+
+    x0 = np.floor(uf).astype(np.int32)
+    y0 = np.floor(vf).astype(np.int32)
+    x1 = np.clip(x0 + 1, 0, feat_w - 1)
+    y1 = np.clip(y0 + 1, 0, feat_h - 1)
+    wx = (uf - x0).astype(np.float32)
+    wy = (vf - y0).astype(np.float32)
+
+    f00 = feat_map[:, y0, x0].T
+    f01 = feat_map[:, y1, x0].T
+    f10 = feat_map[:, y0, x1].T
+    f11 = feat_map[:, y1, x1].T
+    sampled = ((1 - wx)[:, None] * (1 - wy)[:, None] * f00 +
+               (1 - wx)[:, None] * wy[:, None] * f01 +
+               wx[:, None] * (1 - wy)[:, None] * f10 +
+               wx[:, None] * wy[:, None] * f11)
+
+    point_feats[valid] = sampled.astype(np.float32)
+    return np.nan_to_num(point_feats, copy=False)
+
+
+def rgb_dim_from_parts(feat_dim, cls_dim, mode):
+    if mode == "full":
+        return 2 * int(feat_dim) + int(cls_dim)
+    if mode == "map":
+        return 2 * int(feat_dim)
+    if mode == "cls":
+        return int(cls_dim)
+    raise ValueError(f"unknown rgb mode: {mode}")
+
+
+def infer_moge_feature_dims(moge_feat_dir, files=None):
+    """Return (feature-map channels, cls-token dim) from saved MoGe feature files."""
+    candidates = []
+    if files is not None:
+        candidates.extend(os.path.join(moge_feat_dir, str(f)) for f in files)
+    if os.path.isdir(moge_feat_dir):
+        candidates.extend(os.path.join(moge_feat_dir, f)
+                          for f in sorted(os.listdir(moge_feat_dir))
+                          if f.endswith(".npz") and not f.endswith(".tmp.npz"))
+
+    seen = set()
+    for path in candidates:
+        if path in seen or not os.path.exists(path):
+            continue
+        seen.add(path)
+        try:
+            with np.load(path) as d:
+                feat_dim = int(d["feat_map"].shape[0]) if "feat_map" in d else 0
+                cls_dim = int(d["cls_token"].shape[0]) if "cls_token" in d else 0
+        except Exception:
+            continue
+        if feat_dim > 0 or cls_dim > 0:
+            return feat_dim, cls_dim
+    raise FileNotFoundError(
+        f"no usable MoGe feature npz found in {moge_feat_dir}; run precompute_moge_feat.py first"
+    )
+
+
+def build_rgb_global(xyz, cloud_npz, moge_feat_path, rgb_feat_dim, mode="full", allow_missing=False):
+    """Build one fixed-length RGB/MoGe descriptor for a point patch."""
+    if mode not in RGB_MODES:
+        raise ValueError(f"mode must be one of {RGB_MODES}, got {mode}")
+    if len(xyz) == 0:
+        return np.zeros(rgb_feat_dim, dtype=np.float32)
+    if not os.path.exists(moge_feat_path):
+        if not allow_missing:
+            raise FileNotFoundError(f"missing MoGe feature file: {moge_feat_path}")
+        return np.zeros(rgb_feat_dim, dtype=np.float32)
+
+    with np.load(moge_feat_path) as moge_data:
+        parts = []
+        if mode in ("full", "map"):
+            feat_map = moge_data["feat_map"].astype(np.float32)
+            point_feats = project_features_to_points(
+                xyz, feat_map, cloud_npz["K_norm"], int(cloud_npz["w"]), int(cloud_npz["h"])
+            )
+            parts.extend([point_feats.max(axis=0), point_feats.mean(axis=0)])
+        if mode in ("full", "cls"):
+            parts.append(moge_data["cls_token"].astype(np.float32))
+
+    rgb_global = np.concatenate(parts, axis=0).astype(np.float32)
+    rgb_global = np.nan_to_num(rgb_global, copy=False)
+    if rgb_global.shape[0] != rgb_feat_dim:
+        raise ValueError(
+            f"MoGe feature dim mismatch for {moge_feat_path}: got {rgb_global.shape[0]}, "
+            f"expected {rgb_feat_dim}"
+        )
+    return rgb_global
+
+
+def offset_to_counts(offset):
+    start = torch.cat([offset.new_zeros(1), offset[:-1]])
+    return (offset - start).long()
+
+
+def missing_moge_feature_files(moge_feat_dir, files):
+    return [str(f) for f in files if not os.path.exists(os.path.join(moge_feat_dir, str(f)))]
+
+
+def log_print(out_dir, msg):
+    print(msg, flush=True)
+    with open(os.path.join(out_dir, "train.log"), "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def append_jsonl(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+METRIC_FIELDS = [
+    "time", "step", "split", "loss", "ema_loss", "lr", "mean_ang_err",
+    "median_ang_err", "p10", "steps_per_sec", "best_mean_ang_err"
+]
+
+
+def append_metrics_csv(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=METRIC_FIELDS)
+        if not exists:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in METRIC_FIELDS})
+
+
+def record_metric(out_dir, history, row):
+    row = dict(row)
+    row.setdefault("time", time.strftime("%Y-%m-%d %H:%M:%S"))
+    history.append(row)
+    append_metrics_csv(os.path.join(out_dir, "metrics.csv"), row)
+    append_jsonl(os.path.join(out_dir, "metrics.jsonl"), row)
+
+
+def safe_stem(name, max_len=90):
+    stem = os.path.splitext(os.path.basename(str(name)))[0]
+    stem = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", stem, flags=re.UNICODE)
+    return stem[:max_len] or "sample"
+
+
+def try_import_matplotlib():
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception as exc:
+        print(f"WARNING: matplotlib unavailable, skip plots: {exc}", flush=True)
+        return None
+
+
+def plot_training_curves(history, out_dir):
+    plt = try_import_matplotlib()
+    if plt is None:
+        return
+    train = [r for r in history if r.get("split") == "train"]
+    val = [r for r in history if r.get("split") == "val"]
+    if not train and not val:
+        return
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 11), sharex=False)
+    if train:
+        xs = [int(r["step"]) for r in train]
+        axes[0].plot(xs, [float(r["ema_loss"]) for r in train], label="ema_loss", color="#1f77b4")
+        axes[0].plot(xs, [float(r["loss"]) for r in train], label="loss", color="#9ecae1", alpha=0.45)
+        axes[0].set_ylabel("train loss")
+        axes[0].legend()
+        axes[0].grid(alpha=0.25)
+    if val:
+        xs = [int(r["step"]) for r in val]
+        axes[1].plot(xs, [float(r["mean_ang_err"]) for r in val], marker="o", label="mean", color="#d62728")
+        axes[1].plot(xs, [float(r["median_ang_err"]) for r in val], marker="o", label="median", color="#ff7f0e")
+        axes[1].set_ylabel("angle error (deg)")
+        axes[1].legend()
+        axes[1].grid(alpha=0.25)
+        axes[2].plot(xs, [float(r["p10"]) for r in val], marker="o", label="<=10deg %", color="#2ca02c")
+        axes[2].set_ylabel("validation %")
+        axes[2].set_xlabel("step")
+        axes[2].legend()
+        axes[2].grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "curves.png"), dpi=160)
+    plt.close(fig)
+
+
+def load_patch_xyz(npz_file, pcd_dir, kc_dict, radius, max_points=2500):
+    with np.load(os.path.join(pcd_dir, npz_file)) as d:
+        xyz = d["xyz"][d["label"] == 1].astype(np.float32)
+        kc = kc_dict.get(npz_file)
+        if kc is not None and len(xyz) >= 120:
+            _, pm = cap_patch.extract(xyz, d["K_norm"], int(d["w"]), int(d["h"]), kc, radius_frac=radius)
+            if pm.sum() >= 80:
+                xyz = xyz[pm]
+        if len(xyz) == 0:
+            xyz = d["xyz"].astype(np.float32)
+    xyz = xyz - xyz.mean(0)
+    xyz = xyz / (np.linalg.norm(xyz, axis=1).max() + 1e-9)
+    if max_points > 0 and len(xyz) > max_points:
+        rs = np.random.default_rng(0)
+        xyz = xyz[rs.choice(len(xyz), max_points, replace=False)]
+    return xyz
+
+
+def plot_validation_error_summary(details, step, out_dir):
+    plt = try_import_matplotlib()
+    if plt is None or not details:
+        return
+    vis_dir = os.path.join(out_dir, "val_vis")
+    os.makedirs(vis_dir, exist_ok=True)
+    errs = np.array([d["error_deg"] for d in details], dtype=np.float32)
+    order = np.argsort(errs)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].hist(errs, bins=30, color="#4c78a8", alpha=0.85)
+    axes[0].axvline(float(errs.mean()), color="#e45756", label=f"mean {errs.mean():.2f}")
+    axes[0].axvline(float(np.median(errs)), color="#f58518", label=f"median {np.median(errs):.2f}")
+    axes[0].set_xlabel("angle error (deg)")
+    axes[0].set_ylabel("count")
+    axes[0].legend()
+    axes[0].grid(alpha=0.2)
+
+    axes[1].plot(np.arange(len(errs)), errs[order], color="#54a24b")
+    axes[1].set_xlabel("validation samples sorted by error")
+    axes[1].set_ylabel("angle error (deg)")
+    axes[1].grid(alpha=0.2)
+
+    fig.suptitle(f"Validation error at step {step}")
+    fig.tight_layout()
+    fig.savefig(os.path.join(vis_dir, f"step_{step:06d}_error_summary.png"), dpi=160)
+    plt.close(fig)
+
+
+def plot_sample_cloud_normal(detail, xyz, out_path, title=None):
+    plt = try_import_matplotlib()
+    if plt is None:
+        return
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    pred = np.asarray(detail["pred"], dtype=np.float32)
+    target = np.asarray(detail["target"], dtype=np.float32)
+    fig = plt.figure(figsize=(6.5, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=2, alpha=0.35, c=xyz[:, 2], cmap="viridis")
+    ax.quiver(0, 0, 0, target[0], target[1], target[2], length=0.7, color="#2ca02c", linewidth=2, label="target")
+    ax.quiver(0, 0, 0, pred[0], pred[1], pred[2], length=0.7, color="#d62728", linewidth=2, label="pred")
+    ax.set_title(title or f"validation sample\nerr={detail['error_deg']:.2f}deg")
+    ax.set_box_aspect((1, 1, 1))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_feature_heatmap(npz_file, moge_feat_dir, out_path, title=None):
+    plt = try_import_matplotlib()
+    if plt is None:
+        return
+    path = os.path.join(moge_feat_dir, npz_file)
+    if not os.path.exists(path):
+        return
+    with np.load(path) as d:
+        if "feat_map" not in d:
+            return
+        fmap = d["feat_map"].astype(np.float32)
+    heat = np.linalg.norm(fmap, axis=0)
+    lo, hi = np.percentile(heat, [2, 98])
+    heat = np.clip((heat - lo) / (hi - lo + 1e-9), 0, 1)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    im = ax.imshow(heat, cmap="magma", interpolation="nearest")
+    ax.set_title(title or "MoGe feature-map norm")
+    ax.set_axis_off()
+    fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def save_validation_visuals(details, step, out_dir, pcd_dir, moge_feat_dir, kc_dict, radius, num_samples):
+    if not details or num_samples <= 0:
+        return
+    step_dir = os.path.join(out_dir, "val_vis", f"step_{step:06d}")
+    os.makedirs(step_dir, exist_ok=True)
+    ranked = sorted(details, key=lambda d: d["error_deg"], reverse=True)
+    selected = ranked[:num_samples]
+    for rank, detail in enumerate(selected, 1):
+        name = detail["file"]
+        stem = f"{rank:02d}_err_{detail['error_deg']:.2f}_{safe_stem(name)}"
+        try:
+            xyz = load_patch_xyz(name, pcd_dir, kc_dict, radius)
+            title = f"rank {rank} err={detail['error_deg']:.2f}deg"
+            plot_sample_cloud_normal(detail, xyz, os.path.join(step_dir, stem + "_normal.png"), title=title)
+            plot_feature_heatmap(name, moge_feat_dir, os.path.join(step_dir, stem + "_featmap.png"), title=title)
+        except Exception as exc:
+            print(f"WARNING: failed to visualize {name}: {exc}", flush=True)
 
 
 class DSWithRGB(Dataset):
     """带MoGe RGB特征的数据集。"""
 
     def __init__(self, files, normals, pcd_dir, moge_feat_dir, kc, radius,
-                 train, max_points, weights=None, aug_deg=45.0):
+                 train, max_points, rgb_feat_dim, weights=None, aug_deg=0.0,
+                 rgb_mode="full", allow_missing_rgb=False, return_name=False):
         self.files = files
         self.normals = normals
         self.pcd_dir = pcd_dir
@@ -90,8 +397,12 @@ class DSWithRGB(Dataset):
         self.radius = radius
         self.train = train
         self.maxp = max_points
+        self.rgb_feat_dim = rgb_feat_dim
         self.weights = weights
         self.aug_deg = aug_deg
+        self.rgb_mode = rgb_mode
+        self.allow_missing_rgb = allow_missing_rgb
+        self.return_name = return_name
 
     def __len__(self):
         return len(self.files)
@@ -119,27 +430,10 @@ class DSWithRGB(Dataset):
             idx = rs.choice(len(xyz), self.maxp, replace=False)
             xyz = xyz[idx]
 
-        # 加载MoGe特征
-        moge_feat_path = os.path.join(self.moge_feat_dir, self.files[i])
-        if os.path.exists(moge_feat_path):
-            moge_data = np.load(moge_feat_path)
-            feat_map = moge_data["feat_map"]  # (dim_out, h_low, w_low)
-            cls_token = moge_data["cls_token"]  # (1024,)
-
-            # 投影特征到点云
-            point_feats = project_features_to_points(
-                xyz, feat_map, d["K_norm"], int(d["w"]), int(d["h"])
-            )  # (N, dim_out)
-
-            # 全局池化
-            rgb_global = np.concatenate([
-                point_feats.max(axis=0),  # max pool
-                point_feats.mean(axis=0),  # avg pool
-                cls_token  # CLS token
-            ], axis=0).astype(np.float32)
-        else:
-            # 如果没有MoGe特征，用零填充
-            rgb_global = np.zeros(1024 + 1024, dtype=np.float32)
+        moge_feat_path = os.path.join(self.moge_feat_dir, str(self.files[i]))
+        rgb_global = build_rgb_global(
+            xyz, d, moge_feat_path, self.rgb_feat_dim, self.rgb_mode, self.allow_missing_rgb
+        )
 
         # 中心化和归一化
         xyz = xyz - xyz.mean(0)
@@ -155,7 +449,10 @@ class DSWithRGB(Dataset):
         n = n / (np.linalg.norm(n) + 1e-9)
         w = float(self.weights[i]) if self.weights is not None else 1.0
 
-        return xyz.astype(np.float32), n.astype(np.float32), np.float32(w), rgb_global
+        sample = (xyz.astype(np.float32), n.astype(np.float32), np.float32(w), rgb_global)
+        if self.return_name:
+            return sample + (str(self.files[i]),)
+        return sample
 
 
 def collate(batch):
@@ -166,6 +463,9 @@ def collate(batch):
     normal = torch.from_numpy(np.stack([b[1] for b in batch])).float()
     w = torch.tensor([b[2] for b in batch]).float()
     rgb_global = torch.from_numpy(np.stack([b[3] for b in batch])).float()
+    if len(batch[0]) > 4:
+        names = [b[4] for b in batch]
+        return coord, offset, normal, w, counts, rgb_global, names
     return coord, offset, normal, w, counts, rgb_global
 
 
@@ -177,10 +477,12 @@ class MSECNetWithRGB(nn.Module):
         self.msecnet = MSECNet(cfg)
 
         # RGB特征融合头
-        geom_dim = cfg.d_out_initial * (2 ** (len([s for s in cfg.strides if s > 1])))
+        geom_dim = self.msecnet.classifier[0].in_features
+        self.geom_dim = geom_dim
+        self.rgb_feat_dim = int(rgb_feat_dim)
         self.rgb_proj = nn.Sequential(
             nn.Linear(rgb_feat_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3)
         )
@@ -244,14 +546,19 @@ class MSECNetWithRGB(nn.Module):
         ms_feat_new = self.msecnet.ms_fusion(p_dense, ms_feat, o_dense)[1]
         ms_edge = self.msecnet.edge_transfrom(p_dense, ms_feat_new, o_dense)[1]
         geom_feat = self.msecnet.ee(x, ms_edge)  # (N, geom_dim)
+        if geom_feat.shape[1] != self.geom_dim:
+            raise RuntimeError(f"MSECNet feature dim changed: got {geom_feat.shape[1]}, expected {self.geom_dim}")
 
         # RGB特征投影
         rgb_feat = self.rgb_proj(rgb_global)  # (B, 512)
 
-        # 按batch展开RGB特征到每个点
-        batch_size = rgb_global.shape[0]
-        points_per_batch = geom_feat.shape[0] // batch_size
-        rgb_feat_expanded = rgb_feat.repeat_interleave(points_per_batch, dim=0)  # (N, 512)
+        # 按offset展开RGB特征到每个样本的点，支持batch内变长点云。
+        counts = offset_to_counts(o)
+        if rgb_feat.shape[0] != counts.shape[0]:
+            raise RuntimeError(f"rgb batch={rgb_feat.shape[0]} but offsets={counts.shape[0]}")
+        if int(counts.sum().item()) != geom_feat.shape[0]:
+            raise RuntimeError(f"point count mismatch: offsets sum={int(counts.sum().item())}, geom={geom_feat.shape[0]}")
+        rgb_feat_expanded = rgb_feat.repeat_interleave(counts.to(rgb_feat.device), dim=0)  # (N, 512)
 
         # 门控融合
         alpha = self.gate(geom_feat)  # (N, 1)
@@ -266,10 +573,17 @@ class MSECNetWithRGB(nn.Module):
 def evaluate(model, loader, dev):
     model.eval()
     errs = []
-    for coord, offset, normal, w, counts, rgb_global in loader:
+    details = []
+    for batch in loader:
+        if len(batch) == 7:
+            coord, offset, normal, w, counts, rgb_global, names = batch
+        else:
+            coord, offset, normal, w, counts, rgb_global = batch
+            names = [None] * len(counts)
         coord = coord.to(dev)
         offset = offset.to(dev)
         rgb_global = rgb_global.to(dev)
+        normal = normal.to(dev)
 
         pp = F.normalize(model(coord, torch.zeros(coord.shape[0], 0, device=dev),
                               offset, rgb_global), dim=1)
@@ -277,11 +591,25 @@ def evaluate(model, loader, dev):
         for b, c in enumerate(counts.tolist()):
             agg = F.normalize(pp[idx:idx + c].mean(0), dim=0)
             idx += c
-            cos = float(abs(torch.dot(agg, normal[b].to(dev))).clamp(0, 1))
-            errs.append(np.degrees(np.arccos(cos)))
+            target = F.normalize(normal[b], dim=0)
+            dot = float(torch.dot(agg, target).clamp(-1, 1))
+            cos = abs(dot)
+            err = float(np.degrees(np.arccos(np.clip(cos, 0, 1))))
+            errs.append(err)
+            pred = agg.detach().cpu().numpy().astype(float)
+            target_np = target.detach().cpu().numpy().astype(float)
+            if dot < 0:
+                pred = -pred
+            details.append({
+                "file": names[b],
+                "error_deg": err,
+                "pred": pred.tolist(),
+                "target": target_np.tolist(),
+                "points": int(c),
+            })
 
     e = np.array(errs)
-    return e.mean(), np.median(e), (e <= 10).mean() * 100
+    return e.mean(), np.median(e), (e <= 10).mean() * 100, details
 
 
 def main():
@@ -296,14 +624,34 @@ def main():
     ap.add_argument("--agree", type=float, default=15)
     ap.add_argument("--radius", type=float, default=0.3)
     ap.add_argument("--soft", action="store_true")
-    ap.add_argument("--aug-deg", type=float, default=45.0)
+    ap.add_argument("--aug-deg", type=float, default=0.0,
+                    help="点云/法向旋转增强角度；RGB融合默认0，避免破坏相机视角特征对齐")
+    ap.add_argument("--rgb-mode", choices=RGB_MODES, default="full",
+                    help="full=max/avg投影特征+CLS, map=只用投影特征, cls=只用CLS token")
+    ap.add_argument("--allow-missing-rgb", action="store_true",
+                    help="允许缺失MoGe特征文件并以零向量兜底；默认报错以保证实验可解释")
+    ap.add_argument("--device", default="cuda")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--val-every", type=int, default=1000)
+    ap.add_argument("--log-every", type=int, default=100,
+                    help="每隔多少step写入一次训练loss/lr到train.log和metrics.csv")
+    ap.add_argument("--vis-every", type=int, default=1000,
+                    help="每隔多少step保存验证集可视化；0表示关闭")
+    ap.add_argument("--vis-samples", type=int, default=6,
+                    help="每次验证可视化误差最大的验证样本数量；0表示只画曲线/分布")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt"))
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
-    dev = "cuda"
+    for name in ("train.log", "metrics.csv", "metrics.jsonl"):
+        path = os.path.join(a.out, name)
+        if os.path.exists(path):
+            os.remove(path)
+    dev = a.device
+    history = []
+    run_start = time.strftime("%Y-%m-%d %H:%M:%S")
+    log_print(a.out, f"Run started: {run_start}")
+    log_print(a.out, "Command: " + " ".join(sys.argv))
 
     # 加载标签
     L = np.load(a.labels)
@@ -332,22 +680,65 @@ def main():
         vfiles, vnormals = f2[:nval], n2[:nval]
         files, normals, weights = f2[nval:], n2[nval:], None
 
-    print(f"MSECNet+RGB (max_points={a.max_points}): train {len(files)} / val {len(vfiles)} soft={a.soft}",
-          flush=True)
+    log_print(a.out, f"MSECNet+RGB (max_points={a.max_points}): train {len(files)} / val {len(vfiles)} soft={a.soft}")
+    if a.aug_deg > 0:
+        log_print(a.out, "WARNING: --aug-deg > 0 rotates xyz/labels but not the camera-fixed MoGe features; "
+                  "treat this as an augmentation ablation, not the default RGB-fusion setting.")
+
+    feat_dim, cls_dim = infer_moge_feature_dims(a.moge_feat_dir, list(files) + list(vfiles))
+    if a.rgb_mode in ("full", "map") and feat_dim <= 0:
+        raise RuntimeError(f"rgb_mode={a.rgb_mode} needs feat_map, but no feature-map channels were found")
+    if a.rgb_mode in ("full", "cls") and cls_dim <= 0:
+        raise RuntimeError(f"rgb_mode={a.rgb_mode} needs cls_token, but no CLS token was found")
+    rgb_feat_dim = rgb_dim_from_parts(feat_dim, cls_dim, a.rgb_mode)
+    log_print(a.out, f"MoGe features: feat_dim={feat_dim} cls_dim={cls_dim} mode={a.rgb_mode} rgb_feat_dim={rgb_feat_dim}")
+
+    missing = missing_moge_feature_files(a.moge_feat_dir, list(files) + list(vfiles))
+    if missing:
+        msg = f"missing {len(missing)} MoGe feature files, first missing: {missing[0]}"
+        if not a.allow_missing_rgb:
+            raise FileNotFoundError(msg + "; run precompute_moge_feat.py or pass --allow-missing-rgb")
+        log_print(a.out, "WARNING: " + msg + "; using zero RGB descriptors for missing files")
 
     # 加载knob centers
     KC = json.load(open(os.path.join(ROOT, "shared", "knob_centers.json")))
+    write_json(os.path.join(a.out, "run_config.json"), {
+        "started_at": run_start,
+        "argv": sys.argv,
+        "labels": a.labels,
+        "pcd_dir": a.pcd_dir,
+        "moge_feat_dir": a.moge_feat_dir,
+        "steps": a.steps,
+        "batch_size": a.bs,
+        "max_points": a.max_points,
+        "inlier": a.inlier,
+        "agree": a.agree,
+        "radius": a.radius,
+        "soft": bool(a.soft),
+        "aug_deg": a.aug_deg,
+        "rgb_mode": a.rgb_mode,
+        "rgb_feat_dim": int(rgb_feat_dim),
+        "moge_feat_dim": int(feat_dim),
+        "moge_cls_dim": int(cls_dim),
+        "lr": a.lr,
+        "train_count": int(len(files)),
+        "val_count": int(len(vfiles)),
+        "val_files": [str(x) for x in vfiles],
+    })
 
     # 创建数据集
     tr = DataLoader(
         DSWithRGB(files, normals, a.pcd_dir, a.moge_feat_dir, KC, a.radius,
-                 True, a.max_points, weights, a.aug_deg),
+                  True, a.max_points, rgb_feat_dim, weights=weights,
+                  aug_deg=a.aug_deg, rgb_mode=a.rgb_mode,
+                  allow_missing_rgb=a.allow_missing_rgb),
         batch_size=a.bs, shuffle=True, num_workers=8,
         drop_last=True, persistent_workers=True, collate_fn=collate
     )
     vl = DataLoader(
         DSWithRGB(vfiles, vnormals, a.pcd_dir, a.moge_feat_dir, KC, a.radius,
-                 False, a.max_points),
+                  False, a.max_points, rgb_feat_dim, rgb_mode=a.rgb_mode,
+                  allow_missing_rgb=a.allow_missing_rgb, return_name=True),
         batch_size=a.bs, shuffle=False, num_workers=4, collate_fn=collate
     )
 
@@ -357,9 +748,6 @@ def main():
     )
     cfg.num_classes = 3
 
-    # RGB特征维度: max_pool(dim_out) + avg_pool(dim_out) + cls_token(1024)
-    # 假设dim_out=768 (DINOv2 ViT-L)
-    rgb_feat_dim = 768 + 768 + 1024
     model = MSECNetWithRGB(cfg, rgb_feat_dim).to(dev)
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -401,18 +789,80 @@ def main():
         opt.step()
         sched.step()
         rl = 0.9 * rl + 0.1 * loss.item()
+        if a.log_every > 0 and (step % a.log_every == 0 or step == 1):
+            steps_per_sec = step / max(time.time() - t0, 1e-9)
+            lr_now = float(sched.get_last_lr()[0])
+            record_metric(a.out, history, {
+                "step": step,
+                "split": "train",
+                "loss": float(loss.item()),
+                "ema_loss": float(rl),
+                "lr": lr_now,
+                "steps_per_sec": steps_per_sec,
+                "best_mean_ang_err": best if best < 999.0 else "",
+            })
+            log_print(a.out, f"  [TRAIN step {step}] loss={loss.item():.5f} ema={rl:.5f} "
+                      f"lr={lr_now:.3e} ({steps_per_sec:.2f}/s)")
 
         if step % a.val_every == 0 or step == a.steps:
-            m, md, p10 = evaluate(model, vl, dev)
-            print(f"  [VAL step {step}] mean_ang_err={m:.2f}deg median={md:.2f}deg "
-                  f"<=10deg:{p10:.0f}% (loss {rl:.4f}, {step/(time.time()-t0):.1f}/s)",
-                  flush=True)
-            if m < best:
+            m, md, p10, details = evaluate(model, vl, dev)
+            steps_per_sec = step / max(time.time() - t0, 1e-9)
+            lr_now = float(sched.get_last_lr()[0])
+            is_best = m < best
+            if is_best:
                 best = m
-                torch.save({"model": model.state_dict()},
-                          os.path.join(a.out, "best.pt"))
+            record_metric(a.out, history, {
+                "step": step,
+                "split": "val",
+                "loss": float(loss.item()),
+                "ema_loss": float(rl),
+                "lr": lr_now,
+                "mean_ang_err": float(m),
+                "median_ang_err": float(md),
+                "p10": float(p10),
+                "steps_per_sec": steps_per_sec,
+                "best_mean_ang_err": float(best),
+            })
+            log_print(a.out, f"  [VAL step {step}] mean_ang_err={m:.2f}deg median={md:.2f}deg "
+                      f"<=10deg:{p10:.0f}% (loss {rl:.4f}, {steps_per_sec:.1f}/s)")
+            val_path = os.path.join(a.out, "val_predictions", f"step_{step:06d}.json")
+            write_json(val_path, {
+                "step": int(step),
+                "mean_ang_err": float(m),
+                "median_ang_err": float(md),
+                "p10": float(p10),
+                "samples": details,
+            })
+            write_json(os.path.join(a.out, "val_predictions", "latest.json"), {
+                "step": int(step),
+                "mean_ang_err": float(m),
+                "median_ang_err": float(md),
+                "p10": float(p10),
+                "samples": details,
+            })
+            plot_training_curves(history, a.out)
+            plot_validation_error_summary(details, step, a.out)
+            if a.vis_every > 0 and (step % a.vis_every == 0 or step == a.steps):
+                save_validation_visuals(
+                    details, step, a.out, a.pcd_dir, a.moge_feat_dir, KC,
+                    a.radius, a.vis_samples
+                )
+            if is_best:
+                torch.save({
+                    "model": model.state_dict(),
+                    "step": step,
+                    "mean_err": float(m),
+                    "median_err": float(md),
+                    "p10": float(p10),
+                    "rgb_feat_dim": int(rgb_feat_dim),
+                    "rgb_mode": a.rgb_mode,
+                    "moge_feat_dim": int(feat_dim),
+                    "moge_cls_dim": int(cls_dim),
+                    "aug_deg": float(a.aug_deg),
+                }, os.path.join(a.out, "best.pt"))
 
-    print(f"done. best mean_ang_err={best:.2f}deg", flush=True)
+    plot_training_curves(history, a.out)
+    log_print(a.out, f"done. best mean_ang_err={best:.2f}deg")
 
 
 if __name__ == "__main__":

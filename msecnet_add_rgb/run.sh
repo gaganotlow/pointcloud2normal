@@ -11,6 +11,7 @@ PCD_DIR="${PCD_DIR:-$ROOT/data/pcd_dataset_roi}"
 LABELS="${LABELS:-$ROOT/shared/normal_labels_patch03.npz}"
 MOGE_FEAT_DIR="${MOGE_FEAT_DIR:-$ROOT/data/moge_features}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HERE/ckpt}"
+IMAGE_DIR="${IMAGE_DIR:-}"
 
 echo "=========================================="
 echo "MSECNet + MoGe RGB特征融合训练"
@@ -29,6 +30,9 @@ if [ ! -d "$MOGE_FEAT_DIR" ] || [ -z "$(ls -A $MOGE_FEAT_DIR 2>/dev/null)" ]; th
     echo "  python $HERE/precompute_moge_feat.py \\"
     echo "      $PCD_DIR \\"
     echo "      $MOGE_FEAT_DIR \\"
+    if [ -n "$IMAGE_DIR" ]; then
+        echo "      --image-dir $IMAGE_DIR \\"
+    fi
     echo "      --device cuda"
     echo ""
     echo "完成后重新运行本脚本。"
@@ -47,10 +51,11 @@ echo ""
 STEPS="${STEPS:-12000}"
 BS="${BS:-12}"
 MAX_POINTS="${MAX_POINTS:-0}"
-AUG_DEG="${AUG_DEG:-45}"
+AUG_DEG="${AUG_DEG:-0}"
 LR="${LR:-5e-4}"
 VAL_EVERY="${VAL_EVERY:-1000}"
 SOFT="${SOFT:---soft}"
+RGB_MODE="${RGB_MODE:-full}"
 
 python "$HERE/train_rgb_fusion.py" \
     "$LABELS" \
@@ -61,6 +66,7 @@ python "$HERE/train_rgb_fusion.py" \
     --bs $BS \
     --max-points $MAX_POINTS \
     --aug-deg $AUG_DEG \
+    --rgb-mode $RGB_MODE \
     --lr $LR \
     --val-every $VAL_EVERY \
     --out "$OUTPUT_DIR"

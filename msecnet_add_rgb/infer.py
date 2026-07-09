@@ -20,11 +20,17 @@ sys.path.insert(0, os.path.join(MROOT, "scripts"))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 
 from util import config
-from train_rgb_fusion import MSECNetWithRGB, project_features_to_points
+from train_rgb_fusion import (
+    MSECNetWithRGB,
+    build_rgb_global,
+    infer_moge_feature_dims,
+    rgb_dim_from_parts,
+)
 import cap_patch
 
 
-def load_sample(npz_file, pcd_dir, moge_feat_dir, kc_dict, radius=0.3):
+def load_sample(npz_file, pcd_dir, moge_feat_dir, kc_dict, rgb_feat_dim, rgb_mode,
+                radius=0.3, allow_missing_rgb=False):
     """加载单个样本的数据。"""
     # 加载点云
     d = np.load(os.path.join(pcd_dir, npz_file))
@@ -41,36 +47,19 @@ def load_sample(npz_file, pcd_dir, moge_feat_dir, kc_dict, radius=0.3):
     if len(xyz) == 0:
         xyz = d["xyz"].astype(np.float32)
 
-    # 加载MoGe特征
     moge_feat_path = os.path.join(moge_feat_dir, npz_file)
-    if os.path.exists(moge_feat_path):
-        moge_data = np.load(moge_feat_path)
-        feat_map = moge_data["feat_map"]
-        cls_token = moge_data["cls_token"]
-
-        # 投影特征
-        point_feats = project_features_to_points(
-            xyz, feat_map, d["K_norm"], int(d["w"]), int(d["h"])
-        )
-
-        # 全局池化
-        rgb_global = np.concatenate([
-            point_feats.max(axis=0),
-            point_feats.mean(axis=0),
-            cls_token
-        ], axis=0).astype(np.float32)
-    else:
-        rgb_global = np.zeros(1024 + 1024, dtype=np.float32)
+    rgb_global = build_rgb_global(xyz, d, moge_feat_path, rgb_feat_dim, rgb_mode, allow_missing_rgb)
 
     # 中心化和归一化
-    xyz = xyz - xyz.mean(0)
+    centroid = xyz.mean(0)
+    xyz = xyz - centroid
     xyz = xyz / (np.linalg.norm(xyz, axis=1).max() + 1e-9)
 
-    return xyz, rgb_global
+    return xyz, rgb_global, centroid.astype(np.float32)
 
 
 @torch.no_grad()
-def predict(model, xyz, rgb_global, device):
+def predict(model, xyz, rgb_global, centroid, device):
     """预测单个样本的法向量。"""
     model.eval()
 
@@ -84,7 +73,14 @@ def predict(model, xyz, rgb_global, device):
     pp = F.normalize(pp, dim=1)
 
     # 聚合per-point预测
-    normal = F.normalize(pp.mean(0), dim=0).cpu().numpy()
+    pp_np = pp.cpu().numpy()
+    camdir = -centroid / (np.linalg.norm(centroid) + 1e-9)
+    flip = (pp_np @ camdir) < 0
+    pp_np[flip] = -pp_np[flip]
+    normal = pp_np.mean(0)
+    normal = normal / (np.linalg.norm(normal) + 1e-9)
+    if normal @ camdir < 0:
+        normal = -normal
 
     return normal
 
@@ -97,6 +93,10 @@ def main():
     ap.add_argument("output_json", help="输出预测结果JSON")
     ap.add_argument("--device", default="cuda", help="设备")
     ap.add_argument("--radius", type=float, default=0.3, help="Knob patch半径")
+    ap.add_argument("--rgb-mode", choices=("full", "map", "cls"), default=None,
+                    help="默认读取checkpoint中的rgb_mode；旧checkpoint可用此参数指定")
+    ap.add_argument("--allow-missing-rgb", action="store_true",
+                    help="允许缺失MoGe特征文件并以零向量兜底；默认跳过缺失样本")
     args = ap.parse_args()
 
     # 加载模型
@@ -104,14 +104,18 @@ def main():
     cfg = config.load_cfg_from_cfg_file(
         os.path.join(MROOT, "scripts/config/pcpnet/config.yaml")
     )
-    cfg.num_classes = 3
-    rgb_feat_dim = 768 + 768 + 1024
-    model = MSECNetWithRGB(cfg, rgb_feat_dim).to(args.device)
-
     ckpt = torch.load(args.checkpoint, map_location=args.device)
+    cfg.num_classes = 3
+    rgb_mode = args.rgb_mode or ckpt.get("rgb_mode", "full")
+    if "rgb_feat_dim" in ckpt:
+        rgb_feat_dim = int(ckpt["rgb_feat_dim"])
+    else:
+        feat_dim, cls_dim = infer_moge_feature_dims(args.moge_feat_dir)
+        rgb_feat_dim = rgb_dim_from_parts(feat_dim, cls_dim, rgb_mode)
+    model = MSECNetWithRGB(cfg, rgb_feat_dim).to(args.device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    print("模型加载完成", flush=True)
+    print(f"模型加载完成 rgb_mode={rgb_mode} rgb_feat_dim={rgb_feat_dim}", flush=True)
 
     # 加载knob centers
     kc_path = os.path.join(ROOT, "shared", "knob_centers.json")
@@ -127,10 +131,11 @@ def main():
             print(f"  处理 {i+1}/{len(npz_files)}...", flush=True)
 
         try:
-            xyz, rgb_global = load_sample(
-                npz_file, args.pcd_dir, args.moge_feat_dir, KC, args.radius
+            xyz, rgb_global, centroid = load_sample(
+                npz_file, args.pcd_dir, args.moge_feat_dir, KC,
+                rgb_feat_dim, rgb_mode, args.radius, args.allow_missing_rgb
             )
-            normal = predict(model, xyz, rgb_global, args.device)
+            normal = predict(model, xyz, rgb_global, centroid, args.device)
             results[npz_file] = {
                 "normal": [float(v) for v in normal]
             }
