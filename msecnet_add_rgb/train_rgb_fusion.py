@@ -5,9 +5,11 @@
 Usage: python train_rgb_fusion.py <labels> <pcd_dir> <moge_feat_dir> [options]
 """
 import argparse
+import copy
 import csv
 import glob
 import json
+import math
 import os
 import re
 import sys
@@ -569,6 +571,53 @@ class MSECNetWithRGB(nn.Module):
         return out
 
 
+class ModelEMA:
+    """Exponential moving average of model weights for stabler validation/inference."""
+
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = float(decay)
+        self.updates = 0
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        # Ramp up EMA early so the averaged weights do not lag too far behind.
+        decay = self.decay * (1.0 - math.exp(-self.updates / 2000.0))
+        model_state = model.state_dict()
+        for key, ema_value in self.ema.state_dict().items():
+            model_value = model_state[key].detach()
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
+            else:
+                ema_value.copy_(model_value)
+
+
+def set_optimizer_lr(opt, lr):
+    for group in opt.param_groups:
+        group["lr"] = float(lr)
+
+
+def get_optimizer_lr(opt):
+    return float(opt.param_groups[0]["lr"])
+
+
+def cosine_lr(step, total_steps, base_lr, min_lr, warmup_steps, warmup_start_factor):
+    """1-based step cosine schedule with linear warmup and non-zero LR floor."""
+    step = int(step)
+    total_steps = max(int(total_steps), 1)
+    warmup_steps = max(int(warmup_steps), 0)
+    if warmup_steps > 0 and step <= warmup_steps:
+        alpha = step / float(warmup_steps)
+        return base_lr * (warmup_start_factor + alpha * (1.0 - warmup_start_factor))
+
+    span = max(total_steps - warmup_steps, 1)
+    progress = min(max((step - warmup_steps) / float(span), 0.0), 1.0)
+    return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+
 @torch.no_grad()
 def evaluate(model, loader, dev):
     model.eval()
@@ -632,7 +681,43 @@ def main():
                     help="允许缺失MoGe特征文件并以零向量兜底；默认报错以保证实验可解释")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--wd", type=float, default=1e-4, help="AdamW weight decay")
+    ap.add_argument("--sched", choices=("onecycle", "cosine", "constant"), default="onecycle",
+                    help="learning-rate schedule; onecycle preserves the original behavior")
+    ap.add_argument("--warmup-steps", type=int, default=1000,
+                    help="linear warmup steps for --sched cosine")
+    ap.add_argument("--warmup-start-factor", type=float, default=0.1,
+                    help="initial LR factor for cosine warmup, e.g. 0.1 means 10%% of --lr")
+    ap.add_argument("--min-lr", type=float, default=1e-5,
+                    help="minimum LR for --sched cosine")
+    ap.add_argument("--onecycle-pct-start", type=float, default=0.05)
+    ap.add_argument("--onecycle-div-factor", type=float, default=25.0)
+    ap.add_argument("--onecycle-final-div-factor", type=float, default=10000.0)
+    ap.add_argument("--tail-steps", type=int, default=0,
+                    help="extra low-LR OneCycle steps after the main schedule, still in the same scratch run")
+    ap.add_argument("--tail-lr", type=float, default=1e-5,
+                    help="max LR for the optional tail OneCycle phase")
+    ap.add_argument("--tail-wd", type=float, default=None,
+                    help="weight decay for the optional tail phase; default keeps --wd")
+    ap.add_argument("--tail-pct-start", type=float, default=0.15)
+    ap.add_argument("--tail-div-factor", type=float, default=10.0)
+    ap.add_argument("--tail-final-div-factor", type=float, default=10000.0)
     ap.add_argument("--val-every", type=int, default=1000)
+    ap.add_argument("--patience", type=int, default=0,
+                    help="early stop after this many validations without > --min-delta improvement; 0 disables")
+    ap.add_argument("--min-delta", type=float, default=0.0,
+                    help="minimum mean angular error improvement in degrees to reset patience")
+    ap.add_argument("--grad-clip", type=float, default=0.0,
+                    help="clip global gradient norm when >0")
+    ap.add_argument("--ema", action="store_true",
+                    help="evaluate and save an exponential moving average of model weights")
+    ap.add_argument("--ema-decay", type=float, default=0.999)
+    ap.add_argument("--init-ckpt", default=None,
+                    help="optional checkpoint to initialize model weights for fine-tuning")
+    ap.add_argument("--eval-at-start", action="store_true",
+                    help="run validation before training and seed best.pt from the initial weights")
+    ap.add_argument("--save-last", action="store_true",
+                    help="also save last.pt at every validation")
     ap.add_argument("--log-every", type=int, default=100,
                     help="每隔多少step写入一次训练loss/lr到train.log和metrics.csv")
     ap.add_argument("--vis-every", type=int, default=1000,
@@ -641,6 +726,21 @@ def main():
                     help="每次验证可视化误差最大的验证样本数量；0表示只画曲线/分布")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt"))
     a = ap.parse_args()
+
+    if a.sched == "cosine":
+        if a.min_lr < 0 or a.min_lr > a.lr:
+            raise ValueError("--min-lr must be in [0, --lr] for --sched cosine")
+        if not 0 < a.warmup_start_factor <= 1:
+            raise ValueError("--warmup-start-factor must be in (0, 1]")
+    if not 0 < a.onecycle_pct_start <= 1:
+        raise ValueError("--onecycle-pct-start must be in (0, 1]")
+    if a.tail_steps < 0:
+        raise ValueError("--tail-steps must be >= 0")
+    if a.tail_steps > 0:
+        if a.tail_lr <= 0:
+            raise ValueError("--tail-lr must be > 0 when --tail-steps > 0")
+        if not 0 < a.tail_pct_start <= 1:
+            raise ValueError("--tail-pct-start must be in (0, 1]")
 
     os.makedirs(a.out, exist_ok=True)
     for name in ("train.log", "metrics.csv", "metrics.jsonl"):
@@ -721,6 +821,28 @@ def main():
         "moge_feat_dim": int(feat_dim),
         "moge_cls_dim": int(cls_dim),
         "lr": a.lr,
+        "weight_decay": a.wd,
+        "scheduler": a.sched,
+        "warmup_steps": a.warmup_steps,
+        "warmup_start_factor": a.warmup_start_factor,
+        "min_lr": a.min_lr,
+        "onecycle_pct_start": a.onecycle_pct_start,
+        "onecycle_div_factor": a.onecycle_div_factor,
+        "onecycle_final_div_factor": a.onecycle_final_div_factor,
+        "tail_steps": a.tail_steps,
+        "tail_lr": a.tail_lr,
+        "tail_weight_decay": a.tail_wd,
+        "tail_pct_start": a.tail_pct_start,
+        "tail_div_factor": a.tail_div_factor,
+        "tail_final_div_factor": a.tail_final_div_factor,
+        "total_train_steps": int(a.steps + a.tail_steps),
+        "patience": a.patience,
+        "min_delta": a.min_delta,
+        "grad_clip": a.grad_clip,
+        "ema": bool(a.ema),
+        "ema_decay": a.ema_decay,
+        "init_ckpt": a.init_ckpt,
+        "eval_at_start": bool(a.eval_at_start),
         "train_count": int(len(files)),
         "val_count": int(len(vfiles)),
         "val_files": [str(x) for x in vfiles],
@@ -750,17 +872,119 @@ def main():
 
     model = MSECNetWithRGB(cfg, rgb_feat_dim).to(dev)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=a.lr, total_steps=a.steps, pct_start=0.05
-    )
+    if a.init_ckpt:
+        ckpt = torch.load(a.init_ckpt, map_location=dev)
+        ckpt_mode = ckpt.get("rgb_mode")
+        ckpt_dim = ckpt.get("rgb_feat_dim")
+        if ckpt_mode is not None and ckpt_mode != a.rgb_mode:
+            raise ValueError(f"--init-ckpt rgb_mode={ckpt_mode} does not match current mode={a.rgb_mode}")
+        if ckpt_dim is not None and int(ckpt_dim) != int(rgb_feat_dim):
+            raise ValueError(f"--init-ckpt rgb_feat_dim={ckpt_dim} does not match current dim={rgb_feat_dim}")
+        model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt, strict=True)
+        log_print(a.out, f"Initialized model weights from {a.init_ckpt}")
+
+    ema = ModelEMA(model, a.ema_decay) if a.ema else None
+
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.wd)
+    sched = None
+    if a.sched == "onecycle":
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=a.lr, total_steps=a.steps, pct_start=a.onecycle_pct_start,
+            div_factor=a.onecycle_div_factor, final_div_factor=a.onecycle_final_div_factor
+        )
+    elif a.sched == "constant":
+        set_optimizer_lr(opt, a.lr)
 
     best = 999.0
+    best_step = 0
+    bad_vals = 0
     it = iter(tr)
     rl = 0.0
     t0 = time.time()
+    total_train_steps = int(a.steps + a.tail_steps)
+    tail_sched = None
 
-    for step in range(1, a.steps + 1):
+    def make_ckpt_payload(eval_model, step, mean_err, median_err, p10):
+        return {
+            "model": eval_model.state_dict(),
+            "step": int(step),
+            "mean_err": float(mean_err),
+            "median_err": float(median_err),
+            "p10": float(p10),
+            "rgb_feat_dim": int(rgb_feat_dim),
+            "rgb_mode": a.rgb_mode,
+            "moge_feat_dim": int(feat_dim),
+            "moge_cls_dim": int(cls_dim),
+            "aug_deg": float(a.aug_deg),
+            "scheduler": a.sched,
+            "lr": float(a.lr),
+            "min_lr": float(a.min_lr),
+            "weight_decay": float(a.wd),
+            "ema": bool(a.ema),
+        }
+
+    if a.eval_at_start:
+        eval_model = ema.ema if ema is not None else model
+        m, md, p10, details = evaluate(eval_model, vl, dev)
+        best = float(m)
+        best_step = 0
+        record_metric(a.out, history, {
+            "step": 0,
+            "split": "val",
+            "loss": "",
+            "ema_loss": "",
+            "lr": get_optimizer_lr(opt),
+            "mean_ang_err": float(m),
+            "median_ang_err": float(md),
+            "p10": float(p10),
+            "steps_per_sec": "",
+            "best_mean_ang_err": float(best),
+        })
+        log_print(a.out, f"  [VAL step 0] mean_ang_err={m:.2f}deg median={md:.2f}deg "
+                  f"<=10deg:{p10:.0f}% (initial weights)")
+        write_json(os.path.join(a.out, "val_predictions", "step_000000.json"), {
+            "step": 0,
+            "mean_ang_err": float(m),
+            "median_ang_err": float(md),
+            "p10": float(p10),
+            "samples": details,
+        })
+        write_json(os.path.join(a.out, "val_predictions", "latest.json"), {
+            "step": 0,
+            "mean_ang_err": float(m),
+            "median_ang_err": float(md),
+            "p10": float(p10),
+            "samples": details,
+        })
+        torch.save(make_ckpt_payload(eval_model, 0, m, md, p10), os.path.join(a.out, "best.pt"))
+        # Preserve the original script's effective behavior: after validation,
+        # training continues with dropout/BN in eval mode unless the caller
+        # explicitly changes the model mode in code.
+        model.eval()
+
+    for step in range(1, total_train_steps + 1):
+        if a.tail_steps > 0 and step == a.steps + 1:
+            tail_wd = a.wd if a.tail_wd is None else a.tail_wd
+            for group in opt.param_groups:
+                group["weight_decay"] = float(tail_wd)
+            tail_sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt, max_lr=a.tail_lr, total_steps=a.tail_steps,
+                pct_start=a.tail_pct_start, div_factor=a.tail_div_factor,
+                final_div_factor=a.tail_final_div_factor
+            )
+            log_print(a.out, f"Starting tail phase: steps={a.tail_steps} max_lr={a.tail_lr:.3e} wd={tail_wd}")
+
+        in_tail = a.tail_steps > 0 and step > a.steps
+        if a.sched == "cosine" and not in_tail:
+            set_optimizer_lr(
+                opt,
+                cosine_lr(
+                    step, a.steps, a.lr, a.min_lr,
+                    min(a.warmup_steps, max(a.steps - 1, 0)),
+                    a.warmup_start_factor
+                )
+            )
+
         try:
             coord, offset, normal, w, counts, rgb_global = next(it)
         except StopIteration:
@@ -786,12 +1010,19 @@ def main():
 
         opt.zero_grad()
         loss.backward()
+        if a.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
         opt.step()
-        sched.step()
+        if in_tail:
+            tail_sched.step()
+        elif sched is not None:
+            sched.step()
+        if ema is not None:
+            ema.update(model)
         rl = 0.9 * rl + 0.1 * loss.item()
         if a.log_every > 0 and (step % a.log_every == 0 or step == 1):
             steps_per_sec = step / max(time.time() - t0, 1e-9)
-            lr_now = float(sched.get_last_lr()[0])
+            lr_now = get_optimizer_lr(opt)
             record_metric(a.out, history, {
                 "step": step,
                 "split": "train",
@@ -804,13 +1035,20 @@ def main():
             log_print(a.out, f"  [TRAIN step {step}] loss={loss.item():.5f} ema={rl:.5f} "
                       f"lr={lr_now:.3e} ({steps_per_sec:.2f}/s)")
 
-        if step % a.val_every == 0 or step == a.steps:
-            m, md, p10, details = evaluate(model, vl, dev)
+        if step % a.val_every == 0 or step == total_train_steps:
+            eval_model = ema.ema if ema is not None else model
+            m, md, p10, details = evaluate(eval_model, vl, dev)
             steps_per_sec = step / max(time.time() - t0, 1e-9)
-            lr_now = float(sched.get_last_lr()[0])
-            is_best = m < best
-            if is_best:
+            lr_now = get_optimizer_lr(opt)
+            raw_best = m < best
+            meaningful_best = best >= 999.0 or m < (best - a.min_delta)
+            if raw_best:
                 best = m
+                best_step = step
+            if meaningful_best:
+                bad_vals = 0
+            else:
+                bad_vals += 1
             record_metric(a.out, history, {
                 "step": step,
                 "split": "val",
@@ -842,27 +1080,31 @@ def main():
             })
             plot_training_curves(history, a.out)
             plot_validation_error_summary(details, step, a.out)
-            if a.vis_every > 0 and (step % a.vis_every == 0 or step == a.steps):
+            if a.vis_every > 0 and (step % a.vis_every == 0 or step == total_train_steps):
                 save_validation_visuals(
                     details, step, a.out, a.pcd_dir, a.moge_feat_dir, KC,
                     a.radius, a.vis_samples
                 )
-            if is_best:
-                torch.save({
-                    "model": model.state_dict(),
-                    "step": step,
-                    "mean_err": float(m),
-                    "median_err": float(md),
-                    "p10": float(p10),
-                    "rgb_feat_dim": int(rgb_feat_dim),
-                    "rgb_mode": a.rgb_mode,
-                    "moge_feat_dim": int(feat_dim),
-                    "moge_cls_dim": int(cls_dim),
-                    "aug_deg": float(a.aug_deg),
-                }, os.path.join(a.out, "best.pt"))
+            ckpt_payload = make_ckpt_payload(eval_model, step, m, md, p10)
+            if a.save_last:
+                torch.save(ckpt_payload, os.path.join(a.out, "last.pt"))
+            if raw_best:
+                torch.save(ckpt_payload, os.path.join(a.out, "best.pt"))
+            # When EMA is enabled, evaluation touches only ema.ema. Set the
+            # trainable model to eval too so EMA runs keep the same dropout/BN
+            # dynamics as the original non-EMA training script after validation.
+            if ema is not None:
+                model.eval()
+            if a.patience > 0 and bad_vals >= a.patience:
+                log_print(
+                    a.out,
+                    f"early stop at step {step}: no >{a.min_delta:.4f}deg val improvement "
+                    f"for {bad_vals} validations; best={best:.2f}deg at step {best_step}"
+                )
+                break
 
     plot_training_curves(history, a.out)
-    log_print(a.out, f"done. best mean_ang_err={best:.2f}deg")
+    log_print(a.out, f"done. best mean_ang_err={best:.2f}deg at step {best_step}")
 
 
 if __name__ == "__main__":
