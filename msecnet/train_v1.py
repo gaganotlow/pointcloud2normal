@@ -58,9 +58,27 @@ class CapNormalDS(Dataset):              # data-only copy (no pointnet2 dep) —
         xyz = d["xyz"][d["label"] == 1].astype(np.float32)
         n = self.normals[i].astype(np.float32).copy()
         kc = self.kc.get(self.files[i])
-        if kc is not None and len(xyz) >= 120:
-            _, pm = cap_patch.extract(xyz, d["K_norm"], int(d["w"]), int(d["h"]), kc, radius_frac=self.radius)
-            if pm.sum() >= 80:
+        if kc is not None:
+            if kc.get("selection") == "manual_innercap_sphere":
+                # Match the legacy local-patch rule, but use the human 3D rectangle center instead of OBB.
+                pm = cap_patch.cap_patch_mask(
+                    xyz, np.asarray(kc["center_3d"], dtype=np.float32), radius_frac=self.radius
+                )
+            elif kc.get("selection") in ("manual_rect_prism", "manual_rect_sphere"):
+                # Start from the human rectangle prism and draw the local sphere around its 3D center.
+                pm = cap_patch.cap_patch_mask(
+                    xyz, np.asarray(kc["center_3d"], dtype=np.float32), radius_frac=self.radius
+                )
+            elif "center_3d" in kc:
+                # Human-labelled 3D rectangle center. Do not use the detector OBB.
+                pm = cap_patch.cap_patch_mask(
+                    xyz, np.asarray(kc["center_3d"], dtype=np.float32), radius_frac=self.radius
+                )
+            elif len(xyz) >= 120:
+                _, pm = cap_patch.extract(xyz, d["K_norm"], int(d["w"]), int(d["h"]), kc, radius_frac=self.radius)
+            else:
+                pm = None
+            if pm is not None and pm.sum() >= 80:
                 xyz = xyz[pm]
         if len(xyz) == 0:
             xyz = d["xyz"].astype(np.float32)
@@ -82,6 +100,26 @@ def to_msecnet(xyz_b):
     feat = torch.zeros(B * N, 0, device=coord.device)
     offset = torch.arange(N, B * N + 1, N, dtype=torch.int32, device=coord.device)
     return coord, feat, offset, B, N
+
+
+def split_indices(files, split_path):
+    """Return train/validation indices from a generated, file-name based split JSON."""
+    with open(split_path, encoding="utf-8") as f:
+        split = json.load(f)
+    train_names = set(split.get("train", []))
+    val_names = set(split.get("val", []))
+    overlap = train_names & val_names
+    if overlap:
+        raise ValueError(f"train/val overlap in {split_path}: {next(iter(overlap))}")
+    file_names = [str(x) for x in files]
+    train_idx = np.array([i for i, name in enumerate(file_names) if name in train_names], dtype=np.int64)
+    val_idx = np.array([i for i, name in enumerate(file_names) if name in val_names], dtype=np.int64)
+    unknown = (train_names | val_names) - set(file_names)
+    if unknown:
+        raise ValueError(f"{split_path} references {len(unknown)} files absent from labels")
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        raise ValueError(f"{split_path} must contain non-empty train and val splits")
+    return train_idx, val_idx
 
 
 @torch.no_grad()
@@ -204,12 +242,28 @@ def main():
     ap.add_argument("--radius", type=float, default=0.3); ap.add_argument("--soft", action="store_true")
     ap.add_argument("--aug-deg", type=float, default=45.0)
     ap.add_argument("--lr", type=float, default=5e-4); ap.add_argument("--val-every", type=int, default=100)
+    ap.add_argument("--snapshot-every", type=int, default=1000,
+                    help="save a historical checkpoint every N steps; 0 disables snapshots")
+    ap.add_argument("--centers", default=os.path.join(ROOT, "shared", "knob_centers.json"),
+                    help="JSON anchors; entries with center_3d use the human 3D rectangle center")
+    ap.add_argument("--split", default=None,
+                    help="optional JSON with train/val file lists; use for car-model-disjoint validation")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt_msecnet"))
     a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); dev = "cuda"
     logger = TrainLogger(a.out)
 
     L = np.load(a.labels); inl = L["inlier_frac"]; agr = L["agree_deg"]
-    if a.soft:
+    if a.split:
+        tr_idx, va_idx = split_indices(L["files"], a.split)
+        fa, na = L["files"], L["normal"]
+        files, normals = fa[tr_idx], na[tr_idx]
+        vfiles, vnormals = fa[va_idx], na[va_idx]
+        if a.soft:
+            w_all = (np.clip(inl, 0, 1) * np.clip(1 - agr / 30.0, 0, 1)).astype(np.float32)
+            weights = w_all[tr_idx]
+        else:
+            weights = None
+    elif a.soft:
         fa, na = L["files"], L["normal"]
         w_all = (np.clip(inl, 0, 1) * np.clip(1 - agr / 30.0, 0, 1)).astype(np.float32)
         clean = np.where((inl >= a.inlier) & (agr <= a.agree))[0]
@@ -224,7 +278,8 @@ def main():
         files, normals, weights = f2[nval:], n2[nval:], None
     print(f"MSECNet: train {len(files)} / val {len(vfiles)} (soft={a.soft})", flush=True)
 
-    KC = json.load(open(os.path.join(ROOT, "shared", "knob_centers.json")))
+    with open(a.centers, encoding="utf-8") as f:
+        KC = json.load(f)
     tr = DataLoader(CapNormalDS(files, normals, a.pcd_dir, a.npoints, True, KC, a.radius, False, weights, a.aug_deg),
                     batch_size=a.bs, shuffle=True, num_workers=10, drop_last=True, persistent_workers=True)
     va = DataLoader(CapNormalDS(vfiles, vnormals, a.pcd_dir, a.npoints, False, KC, a.radius, False),
@@ -257,22 +312,57 @@ def main():
                   f"({100*a.bs/(_t.time()-t0):.0f}/s)", flush=True)
             logger.log_train(step, last_loss, lr_now)
             rl = 0.0; t0 = _t.time()
-        if step % a.val_every == 0 or step == a.steps:
+        is_snapshot_step = a.snapshot_every > 0 and (step % a.snapshot_every == 0 or step == a.steps)
+        if step % a.val_every == 0 or is_snapshot_step or step == a.steps:
             m, md, p10 = evaluate(model, va, dev)
             lr_now = sched.get_last_lr()[0]
             print(f"  [VAL step {step}] mean_ang_err={m:.2f}deg median={md:.2f}deg  <=10deg:{p10:.0f}%  "
                   f"(loss {last_loss:.4f}, lr={lr_now:.2e})", flush=True)
             logger.log_val(step, m, md, p10)
             logger.plot_dashboard(step)
-            torch.save({"model": model.state_dict(), "step": step, "mean_err": float(m)},
-                       os.path.join(a.out, "last.pt"))
+            ckpt_payload = {
+                "model": model.state_dict(),
+                "step": step,
+                "mean_err": float(m),
+                "median_err": float(md),
+                "p10": float(p10),
+                "npoints": int(a.npoints),
+                "aug_deg": float(a.aug_deg),
+            }
+            torch.save(ckpt_payload, os.path.join(a.out, "last.pt"))
+            if is_snapshot_step:
+                snapshot_dir = os.path.join(a.out, "snapshots")
+                os.makedirs(snapshot_dir, exist_ok=True)
+                torch.save(ckpt_payload, os.path.join(snapshot_dir, f"step_{step:06d}.pt"))
             if m < best:
                 best = m
-                torch.save({"model": model.state_dict(), "step": step, "mean_err": float(m)},
-                           os.path.join(a.out, "best.pt"))
+                torch.save(ckpt_payload, os.path.join(a.out, "best.pt"))
                 print(f"  -> new best mean_ang_err {best:.2f}deg", flush=True)
     print(f"done. best mean_ang_err={best:.2f}deg", flush=True)
 
 
 if __name__ == "__main__":
     main()
+
+
+'''
+python msecnet/train_v1.py \
+  shared/normal_labels_patch03.npz \
+  data/pcd_dataset_roi \
+  --soft \
+  --out msecnet/ckpt_msecnet_v1
+
+
+python msecnet/train_v1.py \
+  data/msecnet_v1_fuelcap_pass_20260717_manual3d/labels_manual3d.npz \
+  data/msecnet_v1_fuelcap_pass_20260717_manual3d/clouds \
+  --centers data/msecnet_v1_fuelcap_pass_20260717_manual3d/anchors_manual3d.json \
+  --split data/msecnet_v1_fuelcap_pass_20260717_manual3d/split_by_car_model.json \
+  --steps 70000 \
+  --bs 24 \
+  --npoints 1024 \
+  --radius 0.3 \
+  --aug-deg 45 \
+  --snapshot-every 1000 \
+  --out msecnet/ckpt_msecnet_v1_manual_center_20260721
+'''

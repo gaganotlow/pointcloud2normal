@@ -142,10 +142,12 @@ function updateInfo(){
   const d=THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(n.dot(pre)))));
   const mr=cur.model_label?THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(new THREE.Vector3(cur.model_label[0],cur.model_label[1],cur.model_label[2]).normalize().dot(pre))))):null;
   const tierNames={clean:'干净',review:'复核',mid:'中档',rest:'无OBB',drop:'丢弃'};
+  const evalInfo=cur.readonly
+    ? `测试集只读  车型=${cur.car_model||'-'}\n🔴人工标签 ↔ 🟠MSECNet = ${cur.prediction_error_deg!=null?cur.prediction_error_deg.toFixed(2):mr?.toFixed(2)}°  聚合强度=${cur.quality!=null?cur.quality.toFixed(2):'-'}\n`
+    : `取点=${MODENAME[cur.mode]||cur.mode}  点数=${cur.npts}  内盖点=${cur.ninner}  档=${tierNames[cur.tier]||cur.tier||'-'}\n平面质量=${cur.quality!=null?cur.quality.toFixed(2):'-'}  🔴🟠模型↔规则=${mr!=null?mr.toFixed(0)+'°':'-'}\n`;
   document.getElementById('info').textContent=
     `[${idx+1}/${N}] ${cur.file.slice(0,36)}  ${cur.is_saved?'(已标注)':''}${cur.flagged?'⚠'+cur.flagged:''}\n`+
-    `取点=${MODENAME[cur.mode]||cur.mode}  点数=${cur.npts}  内盖点=${cur.ninner}  档=${tierNames[cur.tier]||cur.tier||'-'}\n`+
-    `平面质量=${cur.quality!=null?cur.quality.toFixed(2):'-'}  🔴🟠模型↔规则=${mr!=null?mr.toFixed(0)+'°':'-'}\n`+
+    evalInfo+
     `法向 n=(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})  Δ预标=${d.toFixed(1)}°`;
   // progress in bottom status bar
   const pct=((idx+1)/N*100).toFixed(0);
@@ -166,6 +168,9 @@ async function load(i){
     posA[b]=f32[a];posA[b+1]=f32[a+1];posA[b+2]=f32[a+2];
     rgbC[b]=f32[a+3];rgbC[b+1]=f32[a+4];rgbC[b+2]=f32[a+5]; }
   idx=cur.i; N=cur.n; undo.length=0;
+  tcontrol.enabled=!cur.readonly;
+  document.getElementById('save').style.display=cur.readonly?'none':'';
+  document.getElementById('flag').style.display=cur.readonly?'none':'';
   if(cloud){scene.remove(cloud); cloud.geometry.dispose(); cloud.material.dispose();}
   const g=new THREE.BufferGeometry();
   g.setAttribute('position',new THREE.BufferAttribute(posA,3));
@@ -182,12 +187,14 @@ async function load(i){
   else { discW=0.5; discH=0.32; discDir=null; }
   discScale=1; buildDisc();
   viewCamera();                                        // default: match the RGB photo viewpoint
-  document.getElementById('photo').src=cur.photo;
+  const photo=document.getElementById('photo');
+  photo.src=cur.photo; photo.style.display=cur.photo?'block':'none';
   const si=document.getElementById('src');
   if(cur.has_src){ si.style.display='block'; si.src='/api/srcimg/'+idx+'?t='+Date.now(); } else si.style.display='none';
   updateInfo();
 }
 async function save(){
+  if(!cur||cur.readonly) return;
   await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({file:cur.file,normal:getNormal().toArray()})});
   load(idx+1);
@@ -222,6 +229,7 @@ document.getElementById('bigger').onclick=()=>setPt(ptSize*1.3);
 document.getElementById('smaller').onclick=()=>setPt(ptSize/1.3);
 document.getElementById('patch').onclick=()=>{mode=MODES[(MODES.indexOf(mode)+1)%MODES.length]; load(idx);};
 async function flagBad(){ if(!cur) return;
+  if(cur.readonly) return;
   await fetch('/api/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:cur.file,flag:'abnormal'})});
   load(idx+1);
 }
@@ -252,7 +260,7 @@ addEventListener('keydown',e=>{
   if(e.key==='ArrowDown')ax=new THREE.Vector3(-1,0,0).applyQuaternion(camera.quaternion);
   if(e.key==='ArrowLeft')ax=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
   if(e.key==='ArrowRight')ax=new THREE.Vector3(0,0,1).applyQuaternion(camera.quaternion);
-  if(ax){e.preventDefault(); pushUndo(); pivot.rotateOnWorldAxis(ax.normalize(),step); applyColor(); updateInfo();}
+  if(ax&&!cur.readonly){e.preventDefault(); pushUndo(); pivot.rotateOnWorldAxis(ax.normalize(),step); applyColor(); updateInfo();}
 });
 function resize(){ const w=innerWidth,h=innerHeight-56; renderer.setSize(w,h,false); camera.aspect=w/h;
   camera.setViewOffset(w,h, Math.round(w*0.13),0, w,h);   // shift cloud ~13% left (RGB panels sit on the right)

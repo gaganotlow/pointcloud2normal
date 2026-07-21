@@ -142,6 +142,19 @@ FULL_CLOUD=0 python web_label/server.py --port 8765
 
 标注结果保存在 `output/manual_normals.json`。
 
+### 查看 MSECNet v1 测试集推理
+
+`msecnet/infer_v1.py` 生成 `report.json` 后，可用同一个网页查看器检查测试集。此模式为只读：红色箭头是人工 Manual-3D 标签，橙色箭头是 MSECNet 预测，界面显示二者的无向轴角误差；为便于比较，橙色箭头会按红色标签消除 `n/-n` 的方向歧义。
+
+```bash
+/data2/shendu/anaconda3/bin/python web_label/server.py \
+  --msecnet-v1-report msecnet/ckpt_msecnet_v1_manual_center_20260721/inference_test/report.json \
+  --msecnet-v1-dataset data/msecnet_v1_fuelcap_pass_20260717_manual3d \
+  --port 8766
+```
+
+打开 `http://<host>:8766`。可加 `--focus-file 文件名.npz` 只查看一个样本。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
