@@ -25,8 +25,10 @@ train_point2normal/
 │   ├── _norminfer.py        # 法向量推理 + 可视化
 │   └── pointnet2_utils.py   # PointNet++ SA 算子
 ├── msecnet/                 # MSECNet
-│   ├── train_v1.py          # 训练 v1 (固定 1024 点，推荐)
-│   ├── train_v2.py          # 训练 v2 (可变点数)
+│   ├── train.py             # 法向量训练
+│   ├── infer.py             # 划分集推理与评估
+│   ├── prepare_pseudo_obb_dataset.py  # 准备人工伪 OBB 训练数据
+│   ├── export_pseudo_obb_ply.py       # 导出训练面片 PLY
 │   ├── precompute.py        # 批量预计算
 │   └── MSECNet/             # MSECNet 模型库
 │       ├── model/           # architectures, blocks
@@ -46,7 +48,6 @@ train_point2normal/
 ```bash
 cd /data2/shendu/code/ruoyu/train_point2normal
 bash setup.sh
-conda activate point2normal
 ```
 
 setup.sh 会：
@@ -58,7 +59,7 @@ setup.sh 会：
 ### 2. 生成 RANSAC 标签 —— 即训练数据
 
 ```bash
-python shared/make_normal_labels.py data/pcd_dataset_roi \
+conda run --no-capture-output -n point2normal python shared/make_normal_labels.py data/pcd_dataset_roi \
     --radius 0.3 \
     --out shared/normal_labels_patch03.npz
 ```
@@ -67,7 +68,7 @@ python shared/make_normal_labels.py data/pcd_dataset_roi \
 
 ```bash
 # Soft 课程训练（推荐）
-python normalnet/train.py shared/normal_labels_patch03.npz data/pcd_dataset_roi \
+conda run --no-capture-output -n point2normal python normalnet/train.py shared/normal_labels_patch03.npz data/pcd_dataset_roi \
     --steps 80000 --bs 32 --npoints 1024 --soft \
     --radius 0.3 --aug-deg 180 \
     --out normalnet/ckpt_normal
@@ -76,17 +77,21 @@ python normalnet/train.py shared/normal_labels_patch03.npz data/pcd_dataset_roi 
 ### 4. MSECNet 训练
 
 ```bash
-# v1 (推荐，固定 1024 点)
-python msecnet/train_v1.py shared/normal_labels_patch03.npz data/pcd_dataset_roi \
-    --steps 20000 --bs 32 --npoints 1024 --soft \
+# 人工伪 OBB 面片数据集
+conda run --no-capture-output -n point2normal python msecnet/train.py \
+    data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/labels_manual3d.npz \
+    data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/clouds \
+    --centers data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/anchors_manual3d.json \
+    --split data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/split_by_car_model.json \
+    --steps 70000 --bs 24 --max-points 1024 \
     --radius 0.3 --aug-deg 45 \
-    --out msecnet/ckpt_msecnet
+    --out msecnet/out/ckpt_msecnet
 ```
 
 ### 5. 端到端推理
 
 ```bash
-python normalnet/infer_normal.py path/to/image.png
+conda run --no-capture-output -n point2normal python normalnet/infer_normal.py path/to/image.png
 ```
 
 产物在 `output/normal_pred_demo/`。
@@ -97,13 +102,13 @@ python normalnet/infer_normal.py path/to/image.png
 
 ```bash
 # ① MoGe 法向量（绿色箭头）— 无需 GPU，纯 numpy，最快（~2 分钟）
-python shared/precompute_moge_normal.py
+conda run --no-capture-output -n point2normal python shared/precompute_moge_normal.py
 
 # ② NormalNet 推理（用于分档排序 + v3 预标注）— GPU，~5 分钟
-python normalnet/precompute.py normalnet/ckpt_normal/best.pt
+conda run --no-capture-output -n point2normal python normalnet/precompute.py normalnet/ckpt_normal/best.pt
 
 # ③ MSECNet 推理（橙色箭头）— GPU，~10 分钟
-python msecnet/precompute.py msecnet/ckpt_msecnet/best.pt
+conda run --no-capture-output -n point2normal python msecnet/precompute.py msecnet/ckpt_msecnet/best.pt
 ```
 
 产物默认输出到 `shared/` 目录，网页标注工具会自动加载。也可通过第二个参数指定输出路径。
@@ -121,15 +126,14 @@ python msecnet/precompute.py msecnet/ckpt_msecnet/best.pt
 
 ```bash
 # 终端 1: 启动标注服务器
-python web_label/server.py --port 8765
+conda run --no-capture-output -n point2normal python web_label/server.py --port 8765
 
 # 终端 2: (可选但推荐) 启动 MoGe 后台 worker，生成全图稠密点云
 # 首次运行会加载模型到显存 (~1.5GB)，之后每张图 2-4s
-conda activate point2normal
-HF_HOME=models/hf_cache CUDA_VISIBLE_DEVICES=1 python web_label/moge_worker.py
+HF_HOME=models/hf_cache CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n point2normal python web_label/moge_worker.py
 
 # 如果没启动 worker 但感觉加载慢，可以跳过全图云等待:
-FULL_CLOUD=0 python web_label/server.py --port 8765
+FULL_CLOUD=0 conda run --no-capture-output -n point2normal python web_label/server.py --port 8765
 ```
 
 打开 `http://<host>:8765`，在浏览器中用 3D 视图人工校订法向量：
@@ -142,14 +146,23 @@ FULL_CLOUD=0 python web_label/server.py --port 8765
 
 标注结果保存在 `output/manual_normals.json`。
 
-### 查看 MSECNet v1 测试集推理
+### MSECNet 测试集推理与网页查看
 
-`msecnet/infer_v1.py` 生成 `report.json` 后，可用同一个网页查看器检查测试集。此模式为只读：红色箭头是人工 Manual-3D 标签，橙色箭头是 MSECNet 预测，界面显示二者的无向轴角误差；为便于比较，橙色箭头会按红色标签消除 `n/-n` 的方向歧义。
+`Manual Pseudo-OBB` 数据集使用按车型隔离的测试集。运行下面的入口会加载
+`msecnet/out/ckpt_msecnet_v4_manual_pseudo_obb/best.pt`，并在 checkpoint 目录下生成
+`inference_test/report.json` 和 `predictions.csv`。此项目所有命令都使用 `point2normal` 环境。
 
 ```bash
-/data2/shendu/anaconda3/bin/python web_label/server.py \
-  --msecnet-v1-report msecnet/ckpt_msecnet_v1_manual_center_20260721/inference_test/report.json \
-  --msecnet-v1-dataset data/msecnet_v1_fuelcap_pass_20260717_manual3d \
+cd /data2/shendu/code/ruoyu/train_point2normal
+conda run --no-capture-output -n point2normal python msecnet/infer.py
+```
+
+完成后启动网页查看器：
+
+```bash
+conda run --no-capture-output -n point2normal python web_label/server.py \
+  --msecnet-report msecnet/out/ckpt_msecnet_v4_manual_pseudo_obb/inference_test/report.json \
+  --msecnet-dataset data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb \
   --port 8766
 ```
 

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""MSECNet (edge-aware per-point normal net) adapted to OUR single-cap-normal task.
-Input: cap patch points. MSECNet predicts PER-POINT normals; we supervise every point with the (single)
-cap weak-label normal (broadcast), and at val AGGREGATE per-point preds -> one cap normal (axis error).
-Reuses CapNormalDS for patch extraction + SO(3) aug. Env: components/05_msecnet/.venv. GPU.
+"""Train MSECNet to estimate one cap-plane normal from each local point cloud.
 
-Usage: python normal_net_msecnet.py <labels_npz> <pcd_dir> [--steps 15000] [--aug-deg 45] [--soft] ...
+MSECNet predicts a normal for every point. Training broadcasts the sample's
+manual normal target to its points; evaluation averages the point predictions
+to one sign-invariant cap normal. Run in the ``point2normal`` Conda environment.
 """
 import argparse
 import os
@@ -45,9 +44,9 @@ def rand_rot(rs, max_deg=180.0):
     return R.astype(np.float32)
 
 
-class CapNormalDS(Dataset):              # data-only copy (no pointnet2 dep) — matches pose/normal_net.py
-    def __init__(self, files, normals, pcd_dir, npoints, train, kc=None, radius=0.5, use_rgb=False, weights=None, aug_deg=180.0):
-        self.files, self.normals, self.pcd_dir, self.npoints, self.train = files, normals, pcd_dir, npoints, train
+class CapNormalDS(Dataset):
+    def __init__(self, files, normals, pcd_dir, max_points, train, kc=None, radius=0.5, use_rgb=False, weights=None, aug_deg=180.0):
+        self.files, self.normals, self.pcd_dir, self.max_points, self.train = files, normals, pcd_dir, max_points, train
         self.kc = kc or {}; self.radius = radius; self.weights = weights; self.aug_deg = aug_deg
 
     def __len__(self):
@@ -59,11 +58,10 @@ class CapNormalDS(Dataset):              # data-only copy (no pointnet2 dep) —
         n = self.normals[i].astype(np.float32).copy()
         kc = self.kc.get(self.files[i])
         if kc is not None:
-            if kc.get("selection") == "manual_innercap_sphere":
-                # Match the legacy local-patch rule, but use the human 3D rectangle center instead of OBB.
-                pm = cap_patch.cap_patch_mask(
-                    xyz, np.asarray(kc["center_3d"], dtype=np.float32), radius_frac=self.radius
-                )
+            if kc.get("selection") in ("manual_innercap_sphere", "manual_pseudo_obb_patch"):
+                # Prepared manual datasets are already deployment-shaped local patches.
+                # Applying cap_patch_mask again would change their input definition.
+                pm = None
             elif kc.get("selection") in ("manual_rect_prism", "manual_rect_sphere"):
                 # Start from the human rectangle prism and draw the local sphere around its 3D center.
                 pm = cap_patch.cap_patch_mask(
@@ -83,23 +81,50 @@ class CapNormalDS(Dataset):              # data-only copy (no pointnet2 dep) —
         if len(xyz) == 0:
             xyz = d["xyz"].astype(np.float32)
         rs = np.random.RandomState((i * 7919 + int(time.time() * 1000)) & 0x7fffffff if self.train else i)
-        idx = rs.choice(len(xyz), self.npoints, replace=(len(xyz) < self.npoints))
-        xyz = xyz[idx]; xyz = xyz - xyz.mean(0); xyz = xyz / (np.linalg.norm(xyz, axis=1).max() + 1e-9)
+        if self.max_points > 0 and len(xyz) > self.max_points:
+            xyz = xyz[rs.choice(len(xyz), self.max_points, replace=False)]
+        xyz = xyz - xyz.mean(0); xyz = xyz / (np.linalg.norm(xyz, axis=1).max() + 1e-9)
         if self.train:
             R = rand_rot(rs, self.aug_deg); xyz = xyz @ R.T; n = R @ n
             xyz += rs.normal(0, 0.01, xyz.shape).astype(np.float32)
         n = n / (np.linalg.norm(n) + 1e-9)
         w = float(self.weights[i]) if self.weights is not None else 1.0
-        return torch.from_numpy(xyz.T.copy()).float(), torch.zeros(3, len(xyz)), torch.from_numpy(n).float(), torch.tensor(w, dtype=torch.float32)
+        return xyz.astype(np.float32), n.astype(np.float32), np.float32(w)
 
 
-def to_msecnet(xyz_b):
-    """(B,3,N) our batch -> (coord (B*N,3), feat (B*N,0), offset (B,) int32) for MSECNet."""
-    B, _, N = xyz_b.shape
-    coord = xyz_b.permute(0, 2, 1).reshape(B * N, 3).contiguous()
-    feat = torch.zeros(B * N, 0, device=coord.device)
-    offset = torch.arange(N, B * N + 1, N, dtype=torch.int32, device=coord.device)
-    return coord, feat, offset, B, N
+def collate_variable_points(batch):
+    """Pack variable-length point clouds for MSECNet's offset-based interface."""
+    coords = [torch.from_numpy(item[0]) for item in batch]
+    counts = torch.tensor([len(coord) for coord in coords], dtype=torch.int64)
+    return (
+        torch.cat(coords, dim=0).float(),
+        torch.cumsum(counts, dim=0).int(),
+        torch.from_numpy(np.stack([item[1] for item in batch])).float(),
+        torch.tensor([item[2] for item in batch]).float(),
+        counts,
+    )
+
+
+def to_msecnet(coord, offset):
+    """Add the empty feature tensor required by MSECNet to a packed point batch."""
+    return coord, torch.zeros(coord.shape[0], 0, device=coord.device), offset
+
+
+def aggregate_point_normals(point_normals, counts):
+    """Return unnormalized and normalized mean normal vectors for each packed cloud."""
+    means = torch.stack([points.mean(0) for points in torch.split(point_normals, counts.tolist())])
+    return means, F.normalize(means, dim=1)
+
+
+def resolve_max_points(max_points, npoints, default=1024):
+    """Keep --npoints usable for old commands while making the value an upper bound."""
+    if max_points is not None and npoints is not None:
+        raise ValueError("pass only one of --max-points and the deprecated --npoints alias")
+    value = max_points if max_points is not None else npoints
+    value = default if value is None else value
+    if value < 0:
+        raise ValueError("--max-points must be >= 0; 0 keeps every prepared point")
+    return int(value)
 
 
 def split_indices(files, split_path):
@@ -125,10 +150,9 @@ def split_indices(files, split_path):
 @torch.no_grad()
 def evaluate(model, loader, dev):
     model.eval(); errs = []
-    for x, ft, y, w in loader:
-        coord, feat, offset, B, N = to_msecnet(x.to(dev))
-        pp = model(coord, feat, offset).view(B, N, 3)        # per-point normals
-        agg = F.normalize(pp.mean(1), dim=1)                 # aggregate -> cap normal
+    for coord, offset, y, _, counts in loader:
+        coord, feat, offset = to_msecnet(coord.to(dev), offset.to(dev))
+        _, agg = aggregate_point_normals(model(coord, feat, offset), counts)
         cos = (agg * y.to(dev)).sum(1).abs().clamp(0, 1)
         errs.append(torch.rad2deg(torch.arccos(cos)).cpu().numpy())
     e = np.concatenate(errs)
@@ -237,7 +261,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("labels"); ap.add_argument("pcd_dir")
     ap.add_argument("--steps", type=int, default=15000); ap.add_argument("--bs", type=int, default=24)
-    ap.add_argument("--npoints", type=int, default=1024)
+    ap.add_argument("--max-points", type=int, default=None,
+                    help="maximum points per cloud; only larger clouds are sampled without replacement (0 keeps all)")
+    ap.add_argument("--npoints", type=int, default=None,
+                    help="deprecated alias for --max-points; retained for old commands")
     ap.add_argument("--inlier", type=float, default=0.8); ap.add_argument("--agree", type=float, default=15)
     ap.add_argument("--radius", type=float, default=0.3); ap.add_argument("--soft", action="store_true")
     ap.add_argument("--aug-deg", type=float, default=45.0)
@@ -249,7 +276,8 @@ def main():
     ap.add_argument("--split", default=None,
                     help="optional JSON with train/val file lists; use for car-model-disjoint validation")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt_msecnet"))
-    a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); dev = "cuda"
+    a = ap.parse_args(); a.max_points = resolve_max_points(a.max_points, a.npoints)
+    os.makedirs(a.out, exist_ok=True); dev = "cuda"
     logger = TrainLogger(a.out)
 
     L = np.load(a.labels); inl = L["inlier_frac"]; agr = L["agree_deg"]
@@ -276,14 +304,19 @@ def main():
         rng = np.random.default_rng(0); perm = rng.permutation(len(f2)); f2, n2 = f2[perm], n2[perm]
         nval = max(100, len(f2) // 10); vfiles, vnormals = f2[:nval], n2[:nval]
         files, normals, weights = f2[nval:], n2[nval:], None
-    print(f"MSECNet: train {len(files)} / val {len(vfiles)} (soft={a.soft})", flush=True)
+    print(
+        f"MSECNet: train {len(files)} / val {len(vfiles)} "
+        f"(soft={a.soft}, max_points={a.max_points}, variable_batch=True)",
+        flush=True,
+    )
 
     with open(a.centers, encoding="utf-8") as f:
         KC = json.load(f)
-    tr = DataLoader(CapNormalDS(files, normals, a.pcd_dir, a.npoints, True, KC, a.radius, False, weights, a.aug_deg),
-                    batch_size=a.bs, shuffle=True, num_workers=10, drop_last=True, persistent_workers=True)
-    va = DataLoader(CapNormalDS(vfiles, vnormals, a.pcd_dir, a.npoints, False, KC, a.radius, False),
-                    batch_size=a.bs, shuffle=False, num_workers=6)
+    tr = DataLoader(CapNormalDS(files, normals, a.pcd_dir, a.max_points, True, KC, a.radius, False, weights, a.aug_deg),
+                    batch_size=a.bs, shuffle=True, num_workers=10, drop_last=True, persistent_workers=True,
+                    collate_fn=collate_variable_points)
+    va = DataLoader(CapNormalDS(vfiles, vnormals, a.pcd_dir, a.max_points, False, KC, a.radius, False),
+                    batch_size=a.bs, shuffle=False, num_workers=6, collate_fn=collate_variable_points)
 
     cfg = config.load_cfg_from_cfg_file(os.path.join(MROOT, "scripts/config/pcpnet/config.yaml"))
     cfg.num_classes = 3
@@ -294,15 +327,16 @@ def main():
     import time as _t; t0 = _t.time()
     for step in range(1, a.steps + 1):
         try:
-            x, ft, y, w = next(it)
+            coord, offset, y, w, counts = next(it)
         except StopIteration:
-            it = iter(tr); x, ft, y, w = next(it)
-        coord, feat, offset, B, N = to_msecnet(x.to(dev))
+            it = iter(tr); coord, offset, y, w, counts = next(it)
+        coord, feat, offset = to_msecnet(coord.to(dev), offset.to(dev))
         y = y.to(dev); w = w.to(dev)
-        pp = model(coord, feat, offset).view(B, N, 3)        # per-point pred
-        tgt = y[:, None, :].expand(B, N, 3)                  # broadcast cap normal to all points
-        per = 1 - (F.normalize(pp, dim=2) * tgt).sum(2) ** 2  # (B,N) sign-invariant per-point
-        loss = (w[:, None] * per).sum() / (w.sum() * N + 1e-6)
+        pp = model(coord, feat, offset)
+        target_per_point = torch.repeat_interleave(y, counts.to(dev), dim=0)
+        point_loss = 1 - (F.normalize(pp, dim=1) * target_per_point).sum(1) ** 2
+        sample_loss = torch.stack([points.mean() for points in torch.split(point_loss, counts.tolist())])
+        loss = (w * sample_loss).sum() / (w.sum() + 1e-6)
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         rl = 0.9 * rl + 0.1 * loss.item()
         if step % 100 == 0:
@@ -326,7 +360,8 @@ def main():
                 "mean_err": float(m),
                 "median_err": float(md),
                 "p10": float(p10),
-                "npoints": int(a.npoints),
+                "max_points": int(a.max_points),
+                "point_batch_mode": "variable_no_replacement",
                 "aug_deg": float(a.aug_deg),
             }
             torch.save(ckpt_payload, os.path.join(a.out, "last.pt"))
@@ -343,26 +378,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-'''
-python msecnet/train_v1.py \
-  shared/normal_labels_patch03.npz \
-  data/pcd_dataset_roi \
-  --soft \
-  --out msecnet/ckpt_msecnet_v1
-
-
-python msecnet/train_v1.py \
-  data/msecnet_v1_fuelcap_pass_20260717_manual3d/labels_manual3d.npz \
-  data/msecnet_v1_fuelcap_pass_20260717_manual3d/clouds \
-  --centers data/msecnet_v1_fuelcap_pass_20260717_manual3d/anchors_manual3d.json \
-  --split data/msecnet_v1_fuelcap_pass_20260717_manual3d/split_by_car_model.json \
-  --steps 70000 \
-  --bs 24 \
-  --npoints 1024 \
-  --radius 0.3 \
-  --aug-deg 45 \
-  --snapshot-every 1000 \
-  --out msecnet/ckpt_msecnet_v1_manual_center_20260721
-'''

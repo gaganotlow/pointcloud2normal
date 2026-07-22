@@ -142,8 +142,9 @@ function updateInfo(){
   const d=THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(n.dot(pre)))));
   const mr=cur.model_label?THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(new THREE.Vector3(cur.model_label[0],cur.model_label[1],cur.model_label[2]).normalize().dot(pre))))):null;
   const tierNames={clean:'干净',review:'复核',mid:'中档',rest:'无OBB',drop:'丢弃'};
+  const evalViewNames={'source_0.5m':'原始点云 0.5m',source_full:'原始完整点云',training_10cm_sphere:'训练局部球 10cm'};
   const evalInfo=cur.readonly
-    ? `测试集只读  车型=${cur.car_model||'-'}\n🔴人工标签 ↔ 🟠MSECNet = ${cur.prediction_error_deg!=null?cur.prediction_error_deg.toFixed(2):mr?.toFixed(2)}°  聚合强度=${cur.quality!=null?cur.quality.toFixed(2):'-'}\n`
+    ? `测试集只读  车型=${cur.car_model||'-'}  显示=${evalViewNames[cur.mode]||cur.mode}\n🔴人工标签 ↔ 🟠MSECNet = ${cur.prediction_error_deg!=null?cur.prediction_error_deg.toFixed(2):mr?.toFixed(2)}°  聚合强度=${cur.quality!=null?cur.quality.toFixed(2):'-'}\n`
     : `取点=${MODENAME[cur.mode]||cur.mode}  点数=${cur.npts}  内盖点=${cur.ninner}  档=${tierNames[cur.tier]||cur.tier||'-'}\n平面质量=${cur.quality!=null?cur.quality.toFixed(2):'-'}  🔴🟠模型↔规则=${mr!=null?mr.toFixed(0)+'°':'-'}\n`;
   document.getElementById('info').textContent=
     `[${idx+1}/${N}] ${cur.file.slice(0,36)}  ${cur.is_saved?'(已标注)':''}${cur.flagged?'⚠'+cur.flagged:''}\n`+

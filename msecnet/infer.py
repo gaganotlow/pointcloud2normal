@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""Run MSECNet v1 inference on a named split and report normal-axis error.
+"""Evaluate MSECNet normal predictions on a named dataset split.
 
-The default split is the held-out ``test`` split from the manual-3D dataset.
-It deliberately reuses ``CapNormalDS`` from train_v1.py so its local-sphere
-selection, random point sample, centering, and normalization are identical to
-validation during training.
-
-Example:
-    /data2/shendu/code/ruoyu/fuelcap_6dpose/components/05_msecnet/.venv/bin/python \
-      msecnet/infer_v1.py \
-      msecnet/ckpt_msecnet_v1_manual_center_20260721/best.pt \
-      data/msecnet_v1_fuelcap_pass_20260717_manual3d/labels_manual3d.npz \
-      data/msecnet_v1_fuelcap_pass_20260717_manual3d/clouds \
-      --centers data/msecnet_v1_fuelcap_pass_20260717_manual3d/anchors_manual3d.json \
-      --split data/msecnet_v1_fuelcap_pass_20260717_manual3d/split_by_car_model.json
+Without arguments, this evaluates the completed Manual Pseudo-OBB training run
+on its held-out test split. The dataset and checkpoint paths may be overridden
+through the positional path arguments and options below.
 """
 import argparse
 import csv
@@ -30,12 +20,21 @@ from torch.utils.data import DataLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MROOT = os.path.join(HERE, "MSECNet")
+PROJECT_ROOT = Path(HERE).parent
+DEFAULT_DATASET_DIR = PROJECT_ROOT / "data" / "msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "msecnet" / "out" / "ckpt_msecnet_v4_manual_pseudo_obb" / "best.pt"
 sys.path.insert(0, os.path.join(MROOT, "model"))
 sys.path.insert(0, os.path.join(MROOT, "scripts"))
 
 from architectures import MSECNet  # noqa: E402
 from util import config  # noqa: E402
-from train_v1 import CapNormalDS, to_msecnet  # noqa: E402
+from train import (  # noqa: E402
+    CapNormalDS,
+    aggregate_point_normals,
+    collate_variable_points,
+    resolve_max_points,
+    to_msecnet,
+)
 
 
 def load_split_indices(files, split_path, split_name):
@@ -81,16 +80,16 @@ def infer(model, loader, device, file_names, model_by_file):
     model.eval()
     rows = []
     sample_offset = 0
-    for xyz, _, target, _ in loader:
-        coord, feat, offset, batch_size, npoints = to_msecnet(xyz.to(device, non_blocking=True))
-        point_normals = model(coord, feat, offset).view(batch_size, npoints, 3)
-        mean_vector = point_normals.mean(1)
-        normal = F.normalize(mean_vector, dim=1)
+    for coord, offset, target, _, counts in loader:
+        coord, feat, offset = to_msecnet(
+            coord.to(device, non_blocking=True), offset.to(device, non_blocking=True)
+        )
+        mean_vector, normal = aggregate_point_normals(model(coord, feat, offset), counts)
         target = target.to(device, non_blocking=True)
         cosine = (normal * target).sum(1).abs().clamp(0, 1)
         errors = torch.rad2deg(torch.arccos(cosine))
         confidence = mean_vector.norm(dim=1)
-        for batch_index in range(batch_size):
+        for batch_index in range(len(counts)):
             name = str(file_names[sample_offset + batch_index])
             rows.append({
                 "file": name,
@@ -100,7 +99,7 @@ def infer(model, loader, device, file_names, model_by_file):
                 "axis_error_deg": float(errors[batch_index].cpu()),
                 "mean_vector_norm": float(confidence[batch_index].cpu()),
             })
-        sample_offset += batch_size
+        sample_offset += len(counts)
     if sample_offset != len(file_names):
         raise RuntimeError(f"inference returned {sample_offset} samples; expected {len(file_names)}")
     return rows
@@ -135,22 +134,24 @@ def write_outputs(out_dir, metadata, rows):
     return json_path, csv_path, report["summary"]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="MSECNet v1 split inference and held-out-set evaluation")
-    parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("labels", type=Path)
-    parser.add_argument("pcd_dir", type=Path)
-    parser.add_argument("--centers", type=Path, default=None)
-    parser.add_argument("--split", type=Path, required=True)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="MSECNet split inference and held-out-set evaluation")
+    parser.add_argument("checkpoint", type=Path, nargs="?", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("labels", type=Path, nargs="?", default=DEFAULT_DATASET_DIR / "labels_manual3d.npz")
+    parser.add_argument("pcd_dir", type=Path, nargs="?", default=DEFAULT_DATASET_DIR / "clouds")
+    parser.add_argument("--centers", type=Path, default=DEFAULT_DATASET_DIR / "anchors_manual3d.json")
+    parser.add_argument("--split", type=Path, default=DEFAULT_DATASET_DIR / "split_by_car_model.json")
     parser.add_argument("--split-name", choices=("train", "val", "test"), default="test")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--max-points", type=int, default=None,
+                        help="maximum points per cloud; defaults to the checkpoint value (0 keeps all)")
     parser.add_argument("--npoints", type=int, default=None,
-                        help="defaults to the npoints value stored in the checkpoint")
+                        help="deprecated alias for --max-points")
     parser.add_argument("--radius", type=float, default=0.3)
     parser.add_argument("--device", default="cuda")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.device.startswith("cuda") or not torch.cuda.is_available():
         raise RuntimeError("CUDA is required by this MSECNet pointops implementation")
@@ -166,9 +167,9 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"{args.checkpoint} is missing model weights")
-    npoints = int(checkpoint.get("npoints", 1024)) if args.npoints is None else args.npoints
-    if npoints < 1:
-        raise ValueError("--npoints must be >= 1")
+    max_points = resolve_max_points(
+        args.max_points, args.npoints, default=int(checkpoint.get("max_points", checkpoint.get("npoints", 1024)))
+    )
 
     labels = np.load(args.labels)
     indices = load_split_indices(labels["files"], args.split, args.split_name)
@@ -177,15 +178,15 @@ def main():
     with open(centers_path, encoding="utf-8") as f:
         centers = json.load(f)
     models = load_models(args.labels.parent / "manifest.jsonl")
-    dataset = CapNormalDS(files, normals, str(args.pcd_dir), npoints, False, centers, args.radius)
+    dataset = CapNormalDS(files, normals, str(args.pcd_dir), max_points, False, centers, args.radius)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
-                        pin_memory=args.device.startswith("cuda"))
+                        pin_memory=args.device.startswith("cuda"), collate_fn=collate_variable_points)
 
     cfg = config.load_cfg_from_cfg_file(os.path.join(MROOT, "scripts/config/pcpnet/config.yaml"))
     cfg.num_classes = 3
     model = MSECNet(cfg).to(args.device)
     model.load_state_dict(checkpoint["model"], strict=True)
-    print(f"loaded checkpoint step={checkpoint.get('step', 'unknown')} npoints={npoints}", flush=True)
+    print(f"loaded checkpoint step={checkpoint.get('step', 'unknown')} max_points={max_points}", flush=True)
     print(f"infer split={args.split_name} samples={len(dataset)} batch_size={args.batch_size}", flush=True)
     rows = infer(model, loader, args.device, files, models)
 
@@ -197,7 +198,7 @@ def main():
         "pcd_dir": str(args.pcd_dir.resolve()),
         "split": str(args.split.resolve()),
         "split_name": args.split_name,
-        "npoints": npoints,
+        "max_points": max_points,
         "radius": args.radius,
         "device": args.device,
     }
