@@ -26,6 +26,7 @@ ckpt*/
 *.pth
 *.ckpt
 *.onnx
+out/
 
 # ---- 训练 / 推理输出 (training & inference outputs) ----
 /output/

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Train MSECNet to estimate one cap-plane normal from each local point cloud.
+"""Train MSECNet to estimate one *oriented* cap-plane normal per local patch.
 
-MSECNet predicts a normal for every point. Training broadcasts the sample's
-manual normal target to its points; evaluation averages the point predictions
-to one sign-invariant cap normal. Run in the ``point2normal`` Conda environment.
+MSECNet produces a vector per input point. Manual labels are consistently
+oriented toward the camera, so training normalizes the point vectors and
+optimizes the normalized mean vector that is used at inference time. A smaller
+per-point term keeps the individual vectors coherent with that patch target.
+Run in the ``point2normal`` Conda environment.
 """
 import argparse
+import csv
+import random
 import os
 import sys
 from collections import defaultdict
@@ -33,7 +37,13 @@ from architectures import MSECNet                    # noqa: E402
 from torch.utils.data import Dataset                 # noqa: E402
 import cap_patch                                     # noqa: E402
 import json                                          # noqa: E402
-import time                                          # noqa: E402
+
+
+NORMAL_EPS = 1e-6
+METRIC_COLUMNS = (
+    "step", "train_loss", "lr", "val_loss", "val_mean_ang_err",
+    "val_median_ang_err", "val_acc10_pct", "val_point_consensus",
+)
 
 
 def rand_rot(rs, max_deg=180.0):
@@ -45,9 +55,9 @@ def rand_rot(rs, max_deg=180.0):
 
 
 class CapNormalDS(Dataset):
-    def __init__(self, files, normals, pcd_dir, max_points, train, kc=None, radius=0.5, use_rgb=False, weights=None, aug_deg=180.0):
+    def __init__(self, files, normals, pcd_dir, max_points, train, kc=None, radius=0.5, use_rgb=False, weights=None, aug_deg=180.0, seed=None):
         self.files, self.normals, self.pcd_dir, self.max_points, self.train = files, normals, pcd_dir, max_points, train
-        self.kc = kc or {}; self.radius = radius; self.weights = weights; self.aug_deg = aug_deg
+        self.kc = kc or {}; self.radius = radius; self.weights = weights; self.aug_deg = aug_deg; self.seed = seed
 
     def __len__(self):
         return len(self.files)
@@ -80,7 +90,12 @@ class CapNormalDS(Dataset):
                 xyz = xyz[pm]
         if len(xyz) == 0:
             xyz = d["xyz"].astype(np.float32)
-        rs = np.random.RandomState((i * 7919 + int(time.time() * 1000)) & 0x7fffffff if self.train else i)
+        # Training workers receive a reproducible NumPy seed. Validation uses a
+        # sample-local generator, so every validation pass sees exactly the same points.
+        # ``seed=None`` preserves the original legacy inference sampling sequence.
+        rs = np.random if self.train else (
+            np.random.RandomState(i) if self.seed is None else np.random.default_rng(self.seed + i * 7919)
+        )
         if self.max_points > 0 and len(xyz) > self.max_points:
             xyz = xyz[rs.choice(len(xyz), self.max_points, replace=False)]
         xyz = xyz - xyz.mean(0); xyz = xyz / (np.linalg.norm(xyz, axis=1).max() + 1e-9)
@@ -111,9 +126,81 @@ def to_msecnet(coord, offset):
 
 
 def aggregate_point_normals(point_normals, counts):
-    """Return unnormalized and normalized mean normal vectors for each packed cloud."""
+    """Aggregate normalized point directions into one oriented normal per patch.
+
+    ``consensus`` is in [0, 1] for well-formed predictions: 1 means all point
+    directions agree, while values near 0 reveal cancellation or disagreement.
+    """
+    directions = F.normalize(point_normals, dim=1, eps=NORMAL_EPS)
+    means = torch.stack([points.mean(0) for points in torch.split(directions, counts.tolist())])
+    return means, F.normalize(means, dim=1, eps=NORMAL_EPS), directions
+
+
+def aggregate_legacy_point_normals(point_normals, counts):
+    """Historical raw-vector aggregation for checkpoints without run metadata.
+
+    New checkpoints must use :func:`aggregate_point_normals`; this helper only
+    preserves the meaning of already-produced legacy reports.
+    """
     means = torch.stack([points.mean(0) for points in torch.split(point_normals, counts.tolist())])
-    return means, F.normalize(means, dim=1)
+    return means, F.normalize(means, dim=1, eps=NORMAL_EPS)
+
+
+def oriented_angular_error_deg(prediction, target):
+    """Per-sample angular error for camera-oriented unit normals."""
+    cosine = (prediction * target).sum(1).clamp(-1, 1)
+    return torch.rad2deg(torch.arccos(cosine))
+
+
+def normal_losses(point_normals, target, counts, point_loss_weight):
+    """Return weighted patch losses for the deployed oriented aggregation rule."""
+    mean_vectors, patch_normal, directions = aggregate_point_normals(point_normals, counts)
+    target_per_point = torch.repeat_interleave(target, counts.to(target.device), dim=0)
+    point_errors = 1 - (directions * target_per_point).sum(1).clamp(-1, 1)
+    point_loss = torch.stack([errors.mean() for errors in torch.split(point_errors, counts.tolist())])
+    patch_loss = 1 - (patch_normal * target).sum(1).clamp(-1, 1)
+    loss = point_loss_weight * point_loss + (1 - point_loss_weight) * patch_loss
+    return loss, point_loss, patch_loss, patch_normal, mean_vectors
+
+
+def seed_everything(seed):
+    """Seed Python, NumPy, and PyTorch RNGs used by this training process."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id):
+    """Give each DataLoader worker a deterministic, distinct RNG stream."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def atomic_torch_save(payload, path):
+    """Avoid leaving a partially-written checkpoint after interruption."""
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def write_run_metadata(out_dir, args, train_count, val_count):
+    """Record settings that are needed to reproduce a checkpoint."""
+    payload = {
+        "normal_convention": "oriented_toward_camera",
+        "aggregation": "normalize(mean(normalize(point_vectors)))",
+        "loss": {
+            "patch": "1 - dot(patch_normal, target)",
+            "point": "1 - dot(point_normal, target)",
+            "point_weight": args.point_loss_weight,
+        },
+        "train_samples": train_count,
+        "val_samples": val_count,
+        "args": vars(args),
+    }
+    with open(os.path.join(out_dir, "run.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 def resolve_max_points(max_points, npoints, default=1024):
@@ -148,47 +235,65 @@ def split_indices(files, split_path):
 
 
 @torch.no_grad()
-def evaluate(model, loader, dev):
-    model.eval(); errs = []
+def evaluate(model, loader, dev, point_loss_weight):
+    """Evaluate the same oriented, patch-level objective used for selection."""
+    model.eval(); errs = []; losses = []; consensuses = []
     for coord, offset, y, _, counts in loader:
         coord, feat, offset = to_msecnet(coord.to(dev), offset.to(dev))
-        _, agg = aggregate_point_normals(model(coord, feat, offset), counts)
-        cos = (agg * y.to(dev)).sum(1).abs().clamp(0, 1)
-        errs.append(torch.rad2deg(torch.arccos(cos)).cpu().numpy())
+        y = y.to(dev)
+        pp = model(coord, feat, offset)
+        loss, _, _, prediction, mean_vectors = normal_losses(pp, y, counts, point_loss_weight)
+        errs.append(oriented_angular_error_deg(prediction, y).cpu().numpy())
+        losses.append(loss.cpu().numpy())
+        consensuses.append(mean_vectors.norm(dim=1).cpu().numpy())
     e = np.concatenate(errs)
-    return e.mean(), np.median(e), (e <= 10).mean() * 100
+    return {
+        "loss": float(np.concatenate(losses).mean()),
+        "mean_err": float(e.mean()),
+        "median_err": float(np.median(e)),
+        "acc10": float((e <= 10).mean() * 100),
+        "point_consensus": float(np.concatenate(consensuses).mean()),
+    }
 
 
 class TrainLogger:
-    """CSV metrics + dashboard plot per training run."""
+    """Write rectangular CSV metrics and a dashboard for a single training run."""
 
     def __init__(self, out_dir):
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
         self.csv_path = os.path.join(out_dir, "metrics.csv")
         self.history = defaultdict(list)
-        self._csv_header_written = False
+        with open(self.csv_path, "w", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=METRIC_COLUMNS).writeheader()
 
     def log_train(self, step, loss, lr):
-        self._append(step, {"loss": f"{loss:.6f}", "lr": f"{lr:.2e}"})
+        self._append({"step": step, "train_loss": loss, "lr": lr})
 
-    def log_val(self, step, mean_err, median_err, acc10):
-        self._append(step, {
-            "val_mean_ang_err": f"{mean_err:.3f}",
-            "val_median_ang_err": f"{median_err:.3f}",
-            "val_acc10_pct": f"{acc10:.1f}",
+    def log_val(self, step, metrics):
+        self._append({
+            "step": step,
+            "val_loss": metrics["loss"],
+            "val_mean_ang_err": metrics["mean_err"],
+            "val_median_ang_err": metrics["median_err"],
+            "val_acc10_pct": metrics["acc10"],
+            "val_point_consensus": metrics["point_consensus"],
         })
 
-    def _append(self, step, kv):
-        kv["step"] = step
-        keys = ["step"] + [k for k in kv if k != "step"]
-        with open(self.csv_path, "a") as f:
-            if not self._csv_header_written:
-                f.write(",".join(keys) + "\n")
-                self._csv_header_written = True
-            f.write(",".join(str(kv[k]) for k in keys) + "\n")
-        for k, v in kv.items():
-            self.history[k].append(float(v) if k != "step" else int(v))
+    def _append(self, values):
+        row = {name: "" for name in METRIC_COLUMNS}
+        row.update(values)
+        with open(self.csv_path, "a", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=METRIC_COLUMNS).writerow(row)
+        for key, value in values.items():
+            self.history[key].append(int(value) if key == "step" else float(value))
+        step = int(values["step"])
+        if "train_loss" in values:
+            self.history["train_loss_step"].append(step)
+        if "lr" in values:
+            self.history["lr_step"].append(step)
+        if "val_mean_ang_err" in values:
+            self.history["val_mean_ang_err_step"].append(step)
 
     def plot_dashboard(self, step, save_path=None):
         """2×2 training dashboard: loss | val ang err | acc10 | lr."""
@@ -201,9 +306,9 @@ class TrainLogger:
         fig.suptitle(f"MSECNet Training — step {step}", fontsize=13, fontweight="bold")
 
         ax = axes[0, 0]
-        train_steps = [s for i, s in enumerate(h["step"]) if "loss" in h and i < len(h["loss"])]
-        losses = h.get("loss", [])
-        if len(train_steps) == len(losses) and len(losses) > 0:
+        train_steps = h.get("train_loss_step", h.get("step", []))
+        losses = h.get("train_loss", [])
+        if len(train_steps) == len(losses) and losses:
             ax.plot(train_steps, losses, alpha=0.25, color="tab:blue", linewidth=0.6, label="raw (per 50 steps)")
             if len(losses) >= 5:
                 w = min(9, len(losses) - (len(losses) % 2 == 0))
@@ -211,13 +316,14 @@ class TrainLogger:
                     smooth = np.convolve(losses, np.ones(w) / w, mode="valid")
                     smooth_steps = train_steps[w // 2: w // 2 + len(smooth)]
                     ax.plot(smooth_steps, smooth, color="tab:blue", linewidth=1.8, label=f"smooth (w={w})")
-        ax.set_ylabel("Loss  (1 − cos²)")
+        ax.set_ylabel("Training loss")
         ax.set_xlabel("Step")
-        ax.legend(fontsize=8)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
         ax = axes[0, 1]
-        val_steps = [s for i, s in enumerate(h["step"]) if "val_mean_ang_err" in h and i < len(h["val_mean_ang_err"])]
+        val_steps = h.get("val_mean_ang_err_step", [])
         vals = h.get("val_mean_ang_err", [])
         if len(val_steps) == len(vals) and len(vals) > 0:
             ax.plot(val_steps, vals, "o-", color="tab:orange", markersize=3, linewidth=1.2)
@@ -244,7 +350,7 @@ class TrainLogger:
 
         ax = axes[1, 1]
         lrs = h.get("lr", [])
-        lr_steps = [s for i, s in enumerate(h["step"]) if "lr" in h and i < len(h["lr"])]
+        lr_steps = h.get("lr_step", [])
         if len(lr_steps) == len(lrs) and len(lrs) > 0:
             ax.plot(lr_steps, lrs, color="tab:red", linewidth=1.5)
         ax.set_ylabel("Learning Rate")
@@ -258,7 +364,7 @@ class TrainLogger:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Train MSECNet for camera-oriented cap normals")
     ap.add_argument("labels"); ap.add_argument("pcd_dir")
     ap.add_argument("--steps", type=int, default=15000); ap.add_argument("--bs", type=int, default=24)
     ap.add_argument("--max-points", type=int, default=None,
@@ -269,6 +375,13 @@ def main():
     ap.add_argument("--radius", type=float, default=0.3); ap.add_argument("--soft", action="store_true")
     ap.add_argument("--aug-deg", type=float, default=45.0)
     ap.add_argument("--lr", type=float, default=5e-4); ap.add_argument("--val-every", type=int, default=100)
+    ap.add_argument("--point-loss-weight", type=float, default=0.25,
+                    help="weight of per-point loss; the remaining weight optimizes the pooled patch normal")
+    ap.add_argument("--seed", type=int, default=20260722)
+    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--val-workers", type=int, default=6)
+    ap.add_argument("--early-stop-patience", type=int, default=100,
+                    help="validation checks without mean-angle improvement before stopping; 0 disables")
     ap.add_argument("--snapshot-every", type=int, default=1000,
                     help="save a historical checkpoint every N steps; 0 disables snapshots")
     ap.add_argument("--centers", default=os.path.join(ROOT, "shared", "knob_centers.json"),
@@ -277,6 +390,19 @@ def main():
                     help="optional JSON with train/val file lists; use for car-model-disjoint validation")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt_msecnet"))
     a = ap.parse_args(); a.max_points = resolve_max_points(a.max_points, a.npoints)
+    if a.steps < 1 or a.bs < 1 or a.val_every < 1:
+        raise ValueError("--steps, --bs, and --val-every must be positive")
+    if not 0 <= a.point_loss_weight <= 1:
+        raise ValueError("--point-loss-weight must be in [0, 1]")
+    if a.workers < 0 or a.val_workers < 0 or a.early_stop_patience < 0:
+        raise ValueError("worker counts and --early-stop-patience must be non-negative")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required by this MSECNet pointops implementation")
+    if not os.path.isfile(a.labels) or not os.path.isdir(a.pcd_dir):
+        raise FileNotFoundError("labels and pcd_dir must exist")
+    if not os.path.isfile(a.centers):
+        raise FileNotFoundError(a.centers)
+    seed_everything(a.seed)
     os.makedirs(a.out, exist_ok=True); dev = "cuda"
     logger = TrainLogger(a.out)
 
@@ -306,36 +432,45 @@ def main():
         files, normals, weights = f2[nval:], n2[nval:], None
     print(
         f"MSECNet: train {len(files)} / val {len(vfiles)} "
-        f"(soft={a.soft}, max_points={a.max_points}, variable_batch=True)",
+        f"(max_points={a.max_points}, point_loss_weight={a.point_loss_weight}, seed={a.seed})",
         flush=True,
     )
+    if len(files) < a.bs:
+        raise ValueError(f"training split has {len(files)} samples but batch size is {a.bs}")
 
     with open(a.centers, encoding="utf-8") as f:
         KC = json.load(f)
-    tr = DataLoader(CapNormalDS(files, normals, a.pcd_dir, a.max_points, True, KC, a.radius, False, weights, a.aug_deg),
-                    batch_size=a.bs, shuffle=True, num_workers=10, drop_last=True, persistent_workers=True,
-                    collate_fn=collate_variable_points)
-    va = DataLoader(CapNormalDS(vfiles, vnormals, a.pcd_dir, a.max_points, False, KC, a.radius, False),
-                    batch_size=a.bs, shuffle=False, num_workers=6, collate_fn=collate_variable_points)
+    loader_generator = torch.Generator().manual_seed(a.seed)
+    tr = DataLoader(
+        CapNormalDS(files, normals, a.pcd_dir, a.max_points, True, KC, a.radius, False, weights, a.aug_deg, a.seed),
+        batch_size=a.bs, shuffle=True, num_workers=a.workers, drop_last=True,
+        persistent_workers=a.workers > 0, pin_memory=True, worker_init_fn=seed_worker,
+        generator=loader_generator, collate_fn=collate_variable_points,
+    )
+    va = DataLoader(
+        CapNormalDS(vfiles, vnormals, a.pcd_dir, a.max_points, False, KC, a.radius, False, seed=a.seed),
+        batch_size=a.bs, shuffle=False, num_workers=a.val_workers,
+        persistent_workers=a.val_workers > 0, pin_memory=True, worker_init_fn=seed_worker,
+        collate_fn=collate_variable_points,
+    )
+    write_run_metadata(a.out, a, len(files), len(vfiles))
 
     cfg = config.load_cfg_from_cfg_file(os.path.join(MROOT, "scripts/config/pcpnet/config.yaml"))
     cfg.num_classes = 3
     model = MSECNet(cfg).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=a.steps, pct_start=0.05)
-    best = 999.0; it = iter(tr); rl = 0.0; last_loss = 0.0
+    best = float("inf"); checks_without_improvement = 0; it = iter(tr); rl = 0.0; last_loss = 0.0
     import time as _t; t0 = _t.time()
     for step in range(1, a.steps + 1):
         try:
             coord, offset, y, w, counts = next(it)
         except StopIteration:
             it = iter(tr); coord, offset, y, w, counts = next(it)
-        coord, feat, offset = to_msecnet(coord.to(dev), offset.to(dev))
-        y = y.to(dev); w = w.to(dev)
+        coord, feat, offset = to_msecnet(coord.to(dev, non_blocking=True), offset.to(dev, non_blocking=True))
+        y = y.to(dev, non_blocking=True); w = w.to(dev, non_blocking=True)
         pp = model(coord, feat, offset)
-        target_per_point = torch.repeat_interleave(y, counts.to(dev), dim=0)
-        point_loss = 1 - (F.normalize(pp, dim=1) * target_per_point).sum(1) ** 2
-        sample_loss = torch.stack([points.mean() for points in torch.split(point_loss, counts.tolist())])
+        sample_loss, _, _, _, _ = normal_losses(pp, y, counts, a.point_loss_weight)
         loss = (w * sample_loss).sum() / (w.sum() + 1e-6)
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         rl = 0.9 * rl + 0.1 * loss.item()
@@ -348,31 +483,47 @@ def main():
             rl = 0.0; t0 = _t.time()
         is_snapshot_step = a.snapshot_every > 0 and (step % a.snapshot_every == 0 or step == a.steps)
         if step % a.val_every == 0 or is_snapshot_step or step == a.steps:
-            m, md, p10 = evaluate(model, va, dev)
+            metrics = evaluate(model, va, dev, a.point_loss_weight)
             lr_now = sched.get_last_lr()[0]
-            print(f"  [VAL step {step}] mean_ang_err={m:.2f}deg median={md:.2f}deg  <=10deg:{p10:.0f}%  "
-                  f"(loss {last_loss:.4f}, lr={lr_now:.2e})", flush=True)
-            logger.log_val(step, m, md, p10)
+            print(
+                f"  [VAL step {step}] mean_ang_err={metrics['mean_err']:.2f}deg "
+                f"median={metrics['median_err']:.2f}deg <=10deg:{metrics['acc10']:.0f}% "
+                f"consensus={metrics['point_consensus']:.3f} (val_loss {metrics['loss']:.4f})",
+                flush=True,
+            )
+            logger.log_val(step, metrics)
             logger.plot_dashboard(step)
             ckpt_payload = {
                 "model": model.state_dict(),
                 "step": step,
-                "mean_err": float(m),
-                "median_err": float(md),
-                "p10": float(p10),
+                "mean_err": metrics["mean_err"],
+                "median_err": metrics["median_err"],
+                "p10": metrics["acc10"],
+                "val_loss": metrics["loss"],
+                "point_consensus": metrics["point_consensus"],
                 "max_points": int(a.max_points),
                 "point_batch_mode": "variable_no_replacement",
                 "aug_deg": float(a.aug_deg),
+                "normal_convention": "oriented_toward_camera",
+                "aggregation": "normalize(mean(normalize(point_vectors)))",
+                "point_loss_weight": float(a.point_loss_weight),
+                "seed": int(a.seed),
             }
-            torch.save(ckpt_payload, os.path.join(a.out, "last.pt"))
+            atomic_torch_save(ckpt_payload, os.path.join(a.out, "last.pt"))
             if is_snapshot_step:
                 snapshot_dir = os.path.join(a.out, "snapshots")
                 os.makedirs(snapshot_dir, exist_ok=True)
-                torch.save(ckpt_payload, os.path.join(snapshot_dir, f"step_{step:06d}.pt"))
-            if m < best:
-                best = m
-                torch.save(ckpt_payload, os.path.join(a.out, "best.pt"))
+                atomic_torch_save(ckpt_payload, os.path.join(snapshot_dir, f"step_{step:06d}.pt"))
+            if metrics["mean_err"] < best:
+                best = metrics["mean_err"]
+                checks_without_improvement = 0
+                atomic_torch_save(ckpt_payload, os.path.join(a.out, "best.pt"))
                 print(f"  -> new best mean_ang_err {best:.2f}deg", flush=True)
+            else:
+                checks_without_improvement += 1
+            if a.early_stop_patience and checks_without_improvement >= a.early_stop_patience:
+                print(f"early stop after {checks_without_improvement} validations without improvement", flush=True)
+                break
     print(f"done. best mean_ang_err={best:.2f}deg", flush=True)
 
 

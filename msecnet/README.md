@@ -1,163 +1,101 @@
-# point2normal — 内盖法向量估计训练
+# MSECNet 燃油盖内盖法向量估计
 
-从点云估计燃油盖内盖的外法向量。包含两个网络：
-
-| 网络 | 子目录 | 架构 | 参数量 |
-|---|---|---|---|
-| **NormalNet** | `normalnet/` | PointNet++ (3×SA + MLP) | ~1.5M |
-| **MSECNet** | `msecnet/` | U-Net + 多尺度边缘条件 | ~10M |
-
-## 目录结构
-
-```
-train_point2normal/
-├── shared/                  # 两个网络共用
-│   ├── cap_patch.py         # 旋钮局部面片提取
-│   ├── make_normal_labels.py # RANSAC 标签生成
-│   ├── knob_centers_all.py  # OBB 旋钮中心批处理
-│   └── knob_centers.json    # 预计算的旋钮中心
-├── normalnet/               # PointNet++ NormalNet
-│   ├── train.py             # 训练
-│   ├── precompute.py        # 批量预计算
-│   ├── infer_normal.py      # 端到端推理编排
-│   ├── _segobb.py           # YOLO 分割 + OBB
-│   ├── s2_moge.py           # MoGe 深度估计
-│   ├── _norminfer.py        # 法向量推理 + 可视化
-│   └── pointnet2_utils.py   # PointNet++ SA 算子
-├── msecnet/                 # MSECNet
-│   ├── train.py             # 法向量训练
-│   ├── infer.py             # 划分集推理与评估
-│   ├── prepare_pseudo_obb_dataset.py  # 准备人工伪 OBB 训练数据
-│   ├── export_pseudo_obb_ply.py       # 导出训练面片 PLY
-│   ├── precompute.py        # 批量预计算
-│   └── MSECNet/             # MSECNet 模型库
-│       ├── model/           # architectures, blocks
-│       └── scripts/         # config, util, pointops
-├── data/ -> (symlink)       # 训练数据
-│   └── pcd_dataset_roi/     # 点云 ROI 数据集
-├── models/ -> (symlink)     # YOLO 模型权重 + HF cache
-├── output/                  # 推理输出
-├── environment.yml          # conda 环境定义
-└── setup.sh                 # 一键安装脚本
-```
-
-## 快速开始
-
-### 1. 环境安装
+本目录只保留当前 MSECNet 的数据处理、训练、测试集推理和网页查看流程。所有命令均使用 `point2normal` Conda 环境。
 
 ```bash
 cd /data2/shendu/code/ruoyu/train_point2normal
-bash setup.sh
 ```
 
-setup.sh 会：
-- 创建 conda 环境（PyTorch 2.6.0 + CUDA 12.4）
-- 安装 MoGe、ultralytics、trimesh 等依赖
-- 编译 MSECNet 的 pointops_cuda 算子
-- 创建数据和模型的软链接
+## 当前产物
 
-### 2. 生成 RANSAC 标签 —— 即训练数据
-
-```bash
-conda run --no-capture-output -n point2normal python shared/make_normal_labels.py data/pcd_dataset_roi \
-    --radius 0.3 \
-    --out shared/normal_labels_patch03.npz
-```
-
-### 3. NormalNet 训练
-
-```bash
-# Soft 课程训练（推荐）
-conda run --no-capture-output -n point2normal python normalnet/train.py shared/normal_labels_patch03.npz data/pcd_dataset_roi \
-    --steps 80000 --bs 32 --npoints 1024 --soft \
-    --radius 0.3 --aug-deg 180 \
-    --out normalnet/ckpt_normal
-```
-
-### 4. MSECNet 训练
-
-```bash
-# 人工伪 OBB 面片数据集
-conda run --no-capture-output -n point2normal python msecnet/train.py \
-    data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/labels_manual3d.npz \
-    data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/clouds \
-    --centers data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/anchors_manual3d.json \
-    --split data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/split_by_car_model.json \
-    --steps 70000 --bs 24 --max-points 1024 \
-    --radius 0.3 --aug-deg 45 \
-    --out msecnet/out/ckpt_msecnet
-```
-
-### 5. 端到端推理
-
-```bash
-conda run --no-capture-output -n point2normal python normalnet/infer_normal.py path/to/image.png
-```
-
-产物在 `output/normal_pred_demo/`。
-
-### 6. 批量预计算（生成网页标注的参考箭头）
-
-三个预计算脚本，使用相同的数据源（`data/pcd_dataset_roi/` 全部 11135 个点云）：
-
-```bash
-# ① MoGe 法向量（绿色箭头）— 无需 GPU，纯 numpy，最快（~2 分钟）
-conda run --no-capture-output -n point2normal python shared/precompute_moge_normal.py
-
-# ② NormalNet 推理（用于分档排序 + v3 预标注）— GPU，~5 分钟
-conda run --no-capture-output -n point2normal python normalnet/precompute.py normalnet/ckpt_normal/best.pt
-
-# ③ MSECNet 推理（橙色箭头）— GPU，~10 分钟
-conda run --no-capture-output -n point2normal python msecnet/precompute.py msecnet/ckpt_msecnet/best.pt
-```
-
-产物默认输出到 `shared/` 目录，网页标注工具会自动加载。也可通过第二个参数指定输出路径。
-
-### 7. 网页标注工具
-
-标注工具加载 `shared/` 下的预测结果在浏览器中显示为参考箭头：
-
-| 文件 | 箭头颜色 | 来源 |
+| 项目 | 路径 | 说明 |
 |---|---|---|
-| `shared/v3_predictions.json` | 用于分档排序 | 步骤 6②（NormalNet） |
-| `shared/msecnet_predictions.json` | 🟠 橙色 | 步骤 6③（MSECNet） |
-| `shared/moge_norm_predictions.json` | 🟢 绿色 | 步骤 6①（MoGe，零训练） |
-| `shared/normal_labels_full.npz` | 🔴 红色（可编辑） | 步骤 2（RANSAC 几何标签） |
+| 已处理数据集 | `data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/` | 局部 pseudo-OBB 点云面片与人工法向量标签 |
+| 历史基线权重 | `msecnet/out/ckpt_msecnet_v4_manual_pseudo_obb/best.pt` | 旧版无向目标训练的 checkpoint；保留作对照 |
+| 历史基线报告 | `msecnet/out/ckpt_msecnet_v4_manual_pseudo_obb/inference_test/report.json` | 旧版逐样本预测与汇总指标 |
+
+模型只预测法向量方向。网页中的点云起点、蓝色矩形大小和面内切线均来自
+`anchors_manual3d.json` 的人工锚点，不是模型输出。
+
+## 数据集处理
+
+源数据集提供人工复核后的 3D 矩形和法向量。`prepare_pseudo_obb_dataset.py` 会校验标注，按 pseudo-OBB 截取局部棱柱点云，限制每个面片的最大点数，并按车型划分互不重叠的训练、验证、测试集。
 
 ```bash
-# 终端 1: 启动标注服务器
-conda run --no-capture-output -n point2normal python web_label/server.py --port 8765
-
-# 终端 2: (可选但推荐) 启动 MoGe 后台 worker，生成全图稠密点云
-# 首次运行会加载模型到显存 (~1.5GB)，之后每张图 2-4s
-HF_HOME=models/hf_cache CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n point2normal python web_label/moge_worker.py
-
-# 如果没启动 worker 但感觉加载慢，可以跳过全图云等待:
-FULL_CLOUD=0 conda run --no-capture-output -n point2normal python web_label/server.py --port 8765
+conda run --no-capture-output -n point2normal python \
+  msecnet/prepare_pseudo_obb_dataset.py \
+  data/fuelcap_pass_20260717_5873 \
+  data/manual_pseudo_obb_new \
+  --max-points 4096 \
+  --obb-expand 2.0 \
+  --obb-half-depth-m 0.005
 ```
 
-打开 `http://<host>:8765`，在浏览器中用 3D 视图人工校订法向量：
-- 红色箭头 = 可编辑的当前法向量（拖红环旋转）
-- 橙色箭头 = 模型预测 (MSECNet)，固定参考
-- 绿色箭头 = MoGe 深度图法向量（零训练），固定参考
-- 蓝色矩形 = 平面贴合检查器，贴到盖面上即正确
-- 空格 = 保存并下一张，a/d = 上下翻页，x = 标异常
-- r = 绕法向量旋转验证（正确时盖子不晃动）
+生成目录包含：
 
-标注结果保存在 `output/manual_normals.json`。
+| 文件 | 说明 |
+|---|---|
+| `clouds/*.npz` | 训练使用的局部点云面片 |
+| `labels_manual3d.npz` | 样本文件名和人工目标法向量 |
+| `anchors_manual3d.json` | 人工中心、矩形尺寸、切线和法向量 |
+| `split_by_generalization_group.json` | 按真实车型或采集会话隔离、样本量平衡的训练/验证/测试列表 |
+| `manifest.jsonl` | 每个样本的源数据追溯信息与划分 |
 
-### MSECNet 测试集推理与网页查看
-
-`Manual Pseudo-OBB` 数据集使用按车型隔离的测试集。运行下面的入口会加载
-`msecnet/out/ckpt_msecnet_v4_manual_pseudo_obb/best.pt`，并在 checkpoint 目录下生成
-`inference_test/report.json` 和 `predictions.csv`。此项目所有命令都使用 `point2normal` 环境。
+导出一个已处理面片，与源点云进行对照：
 
 ```bash
-cd /data2/shendu/code/ruoyu/train_point2normal
+conda run --no-capture-output -n point2normal python \
+  msecnet/export_pseudo_obb_ply.py \
+  data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb \
+  --file '_未分类_易车网__易车网_data0_2_2019款PlusA8L50TFSIquattro舒适型_25.npz' \
+  --raw-points 50000
+```
+
+## 训练
+
+MSECNet 为面片中的每个点预测向量，但部署目标是每个面片的一条**有向**法向量。人工数据已校验法向量朝向相机（`normal dot (-center) > 0`），因此训练和评估均保留方向：先归一化每点输出，再平均并归一化为面片预测。
+
+训练目标以面片级余弦损失为主，直接优化部署输出；默认以 0.25 权重加入逐点余弦损失，约束点预测的局部一致性。报告中的 `point_consensus` 是归一化点向量平均后的长度，范围为 0 到 1，可用于识别点预测相互抵消的低置信度样本。
+
+`split_by_generalization_group.json` 是用于下一次从头训练的新划分。它与历史 `split_by_car_model.json` 不同，不能拿来评估已经按历史划分训练的 checkpoint，否则新的验证/测试集会包含旧训练样本。
+
+```bash
+conda run --no-capture-output -n point2normal python msecnet/train.py \
+  data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/labels_manual3d.npz \
+  data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/clouds \
+  --centers data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/anchors_manual3d.json \
+  --split data/msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb/split_by_generalization_group.json \
+  --steps 70000 \
+  --bs 24 \
+  --max-points 1024 \
+  --radius 0.3 \
+  --aug-deg 45 \
+  --point-loss-weight 0.25 \
+  --seed 20260722 \
+  --early-stop-patience 100 \
+  --snapshot-every 1000 \
+  --out msecnet/out/manual_pseudo_obb_oriented
+```
+
+当前数据集共有 5,864 个样本：训练集 4,688，验证集 589，测试集 587。
+
+## 测试集推理
+
+不带参数运行时，`infer.py` 会使用当前最优权重在保留的测试集上评估，并在 checkpoint 目录生成 `report.json` 和 `predictions.csv`。
+
+```bash
 conda run --no-capture-output -n point2normal python msecnet/infer.py
 ```
 
-完成后启动网页查看器：
+历史无向基线测试结果（新训练应以有向角误差重新报告，不应与此数值直接混用）：
+
+| 样本数 | 平均轴向误差 | 中位轴向误差 | 轴向误差 <= 10 deg |
+|---:|---:|---:|---:|
+| 587 | 2.407 deg | 2.000 deg | 99.1% |
+
+## 网页查看
+
+评估模式下网页为只读。页面会在源点云上同时显示人工目标法向量与模型预测法向量。蓝色矩形来自人工锚点，用于观察平面贴合效果，不属于模型预测。
 
 ```bash
 conda run --no-capture-output -n point2normal python web_label/server.py \
@@ -166,30 +104,4 @@ conda run --no-capture-output -n point2normal python web_label/server.py \
   --port 8766
 ```
 
-打开 `http://<host>:8766`。可加 `--focus-file 文件名.npz` 只查看一个样本。
-
-## 环境变量
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `CUDA_VISIBLE_DEVICES` | 0 | GPU 设备 |
-| `HF_HOME` | models/hf_cache | HuggingFace 缓存目录 |
-| `PCD_DATASET` | data/pcd_dataset_roi | 点云数据集路径 |
-| `NORMALNET_CKPT` | normalnet/ckpt_normal/best.pt | 推理用 checkpoint |
-| `SEG_MODEL` | models/seg_4_classes_all_0709_train_aug3/best.pt | YOLO 分割模型 |
-| `OBB_MODEL` | models/inner_obb_clean_v11m_0129/best.pt | YOLO OBB 模型 |
-
-## 前置数据
-
-需要以下数据文件（已通过软链接配置）：
-- `data/pcd_dataset_roi/` — 11135 个 .npz 点云文件（~5.1GB）
-- `models/seg_4_classes_all_0709_train_aug3/best.pt` — YOLO 分割模型
-- `models/inner_obb_clean_v11m_0129/best.pt` — YOLO OBB 模型
-- `models/hf_cache/` — HuggingFace 缓存（MoGe 模型 ~1.2GB）
-
-## 已知结果
-
-| 模型 | 变体 | 验证 Mean Ang Err |
-|---|---|---|
-| NormalNet | Soft 课程 (纯 xyz) | 5.39° |
-| MSECNet | soft, inlier≥0.8, agree≤15°, 1024pt | 待复现 |
+浏览器打开 `http://localhost:8766`。追加 `--focus-file FILE.npz` 可只查看一个样本。

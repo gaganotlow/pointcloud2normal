@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+from split_utils import build_group_split
+
 
 REQUIRED_CLOUD_KEYS = {"xyz", "K_norm", "w", "h"}
 
@@ -18,42 +20,6 @@ REQUIRED_CLOUD_KEYS = {"xyz", "K_norm", "w", "h"}
 def write_json(path, value):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(value, f, ensure_ascii=False, indent=2)
-
-
-def assign_model_splits(rows, seed):
-    by_model = defaultdict(list)
-    for row in rows:
-        by_model[row["car_model"]].append(row)
-    rng = np.random.default_rng(seed)
-    models = list(by_model)
-    rng.shuffle(models)
-    tie_breaker = {model: i for i, model in enumerate(models)}
-    sizes = {model: len(items) for model, items in by_model.items()}
-
-    def choose_eval_models(candidates, target_samples, min_models=8):
-        chosen = []
-        total = 0
-        while candidates and (total < target_samples or len(chosen) < min_models):
-            remaining = target_samples - total
-            under_target = [model for model in candidates if sizes[model] <= remaining]
-            options = under_target or candidates
-            model = min(
-                options,
-                key=lambda name: (abs(total + sizes[name] - target_samples), tie_breaker[name]),
-            )
-            candidates.remove(model)
-            chosen.append(model)
-            total += sizes[model]
-        return chosen
-
-    candidates = set(models)
-    target_samples = max(1, round(len(rows) * 0.1))
-    val_models = choose_eval_models(candidates, target_samples)
-    test_models = choose_eval_models(candidates, target_samples)
-    return {
-        model: "val" if model in val_models else "test" if model in test_models else "train"
-        for model in models
-    }
 
 
 def pseudo_obb_mask(xyz, center_3d, pose, rectangle_wh_m, expand, half_depth_m):
@@ -176,10 +142,7 @@ def main():
     if len({item["file"] for item in selected}) != len(selected):
         raise RuntimeError("duplicate destination cloud filenames")
 
-    model_split = assign_model_splits(selected, args.seed)
-    split = {"train": [], "val": [], "test": []}
-    for item in selected:
-        split[model_split[item["car_model"]]].append(item["file"])
+    split, file_split, split_metadata = build_group_split(selected, args.seed)
     if not split["train"] or not split["val"]:
         raise RuntimeError("car-model split did not produce train and val samples")
 
@@ -229,7 +192,7 @@ def main():
         }
         manifest.append({
             "file": item["file"],
-            "split": model_split[item["car_model"]],
+            "split": file_split[item["file"]],
             "dataset": item["dataset"],
             "car_model": item["car_model"],
             "source_cloud": item["source_cloud"],
@@ -256,9 +219,8 @@ def main():
         n_inner=cap_counts,
     )
     write_json(out_dir / "anchors_manual3d.json", anchors)
-    split["seed"] = args.seed
-    split["model_split"] = model_split
-    write_json(out_dir / "split_by_car_model.json", split)
+    split.update(split_metadata)
+    write_json(out_dir / "split_by_generalization_group.json", split)
     with open(out_dir / "manifest.jsonl", "w", encoding="utf-8") as f:
         for row in manifest:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -273,7 +235,7 @@ def main():
         "- Source label==1 and knob_obb are deliberately not used to build the input patch.",
         "- labels_manual3d.npz: human normal targets for MSECNet training.",
         "- anchors_manual3d.json: records pseudo-OBB provenance and the human normal target.",
-        "- split_by_car_model.json: car-model-disjoint train/val/test split.",
+        "- split_by_generalization_group.json: group-disjoint, sample-balanced train/val/test split.",
         "- manifest.jsonl: source traceability for every retained cloud.",
         "",
         f"Retained samples: {len(selected)}",
@@ -284,7 +246,7 @@ def main():
         "",
         "Train with:",
         "python msecnet/train.py DATASET/labels_manual3d.npz DATASET/clouds "
-        "--centers DATASET/anchors_manual3d.json --split DATASET/split_by_car_model.json",
+        "--centers DATASET/anchors_manual3d.json --split DATASET/split_by_generalization_group.json",
         "",
     ])
     (out_dir / "README.md").write_text(readme, encoding="utf-8")

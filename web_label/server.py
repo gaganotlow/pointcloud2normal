@@ -69,6 +69,17 @@ EVAL_MODE = bool(EVAL_REPORT_PATH)
 EVAL_ROWS = {}
 EVAL_ANCHORS = {}
 EVAL_SOURCE_PATHS = {}
+EVAL_ORIENTED = False
+
+
+def report_consensus(row):
+    """Use bounded point agreement from new reports, with legacy fallback."""
+    value = row.get("point_consensus")
+    return float(value) if value is not None else float(row.get("mean_vector_norm", 0.0))
+
+
+def report_error(row):
+    return float(row.get("angular_error_deg", row["axis_error_deg"]))
 
 os.makedirs(os.path.join(ROOT, "output"), exist_ok=True)
 
@@ -194,6 +205,7 @@ if EVAL_MODE:
     if any(not required.issubset(row) for row in rows):
         raise ValueError(f"{EVAL_REPORT_PATH} has incomplete prediction rows")
     EVAL_ROWS = {row["file"]: row for row in rows}
+    EVAL_ORIENTED = report.get("metadata", {}).get("normal_convention") == "oriented_toward_camera"
     EVAL_ANCHORS = json.load(open(os.path.join(EVAL_DATASET_DIR, "anchors_manual3d.json"), encoding="utf-8"))
     source_root = arg_value("--msecnet-source-root") or os.path.join(
         os.path.dirname(EVAL_DATASET_DIR), "fuelcap_pass_20260717_5873"
@@ -207,8 +219,8 @@ if EVAL_MODE:
     PCD = os.path.join(EVAL_DATASET_DIR, "clouds")
     FILES = [row["file"] for row in rows]
     NORMS = [row["target_normal"] for row in rows]
-    CONF = [float(row.get("mean_vector_norm", 0.0)) for row in rows]
-    AGREE = [float(row["axis_error_deg"]) for row in rows]
+    CONF = [report_consensus(row) for row in rows]
+    AGREE = [report_error(row) for row in rows]
     NINNER = [0] * len(rows)
     TIER = {row["file"]: "test" for row in rows}
     PROD = {row["file"]: {"normal": row["pred_normal"]} for row in rows}
@@ -221,8 +233,8 @@ if EVAL_MODE:
             raise ValueError(f"--focus-file is absent from report: {focus_base}")
         FILES = [focus_base]
         NORMS = [EVAL_ROWS[focus_base]["target_normal"]]
-        CONF = [float(EVAL_ROWS[focus_base].get("mean_vector_norm", 0.0))]
-        AGREE = [float(EVAL_ROWS[focus_base]["axis_error_deg"])]
+        CONF = [report_consensus(EVAL_ROWS[focus_base])]
+        AGREE = [report_error(EVAL_ROWS[focus_base])]
         NINNER = [0]
     print(f"MSECNet evaluation viewer: {len(FILES)} samples from {os.path.basename(EVAL_REPORT_PATH)}", flush=True)
 
@@ -392,8 +404,8 @@ def evaluation_cloud(i):
     prediction = np.asarray(row["pred_normal"], dtype=np.float32)
     target /= np.linalg.norm(target) + 1e-9
     prediction /= np.linalg.norm(prediction) + 1e-9
-    # Training/evaluation is sign-invariant. Orient only the displayed arrow to its target.
-    if float(prediction @ target) < 0:
+    # Legacy reports were sign-invariant; new reports preserve this visible orientation.
+    if not EVAL_ORIENTED and float(prediction @ target) < 0:
         prediction = -prediction
     rect = None
     if "rectangle_wh_m" in anchor:
@@ -407,11 +419,11 @@ def evaluation_cloud(i):
         "i": i, "n": len(FILES), "file": f, "conf": CONF[i], "agree": AGREE[i], "ninner": len(training_xyz),
         "labeled_count": 0, "tier": "test", "has_src": False, "mode": mode_name,
         "npts": int(len(pts)), "fullcloud": False, "flagged": None, "knob_rect": rect,
-        "quality": float(row.get("mean_vector_norm", 0.0)), "v3_agree": float(row["axis_error_deg"]),
+        "quality": report_consensus(row), "v3_agree": report_error(row),
         "normal": _flipYZ(target), "prelabel": _flipYZ(target),
         "model_label": _flipYZ(prediction), "moge_label": None, "is_saved": False, "photo": "",
         "readonly": True, "car_model": row.get("car_model", ""),
-        "prediction_error_deg": float(row["axis_error_deg"]),
+        "prediction_error_deg": report_error(row),
     }
     inter = np.empty((len(pts), 6), np.float32)
     inter[:, :3] = pts; inter[:, 3:] = rgb

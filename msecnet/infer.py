@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +22,10 @@ MROOT = os.path.join(HERE, "MSECNet")
 PROJECT_ROOT = Path(HERE).parent
 DEFAULT_DATASET_DIR = PROJECT_ROOT / "data" / "msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb"
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "msecnet" / "out" / "ckpt_msecnet_v4_manual_pseudo_obb" / "best.pt"
+LEGACY_DEFAULT_SPLIT = DEFAULT_DATASET_DIR / "split_by_car_model.json"
+DEFAULT_SPLIT = LEGACY_DEFAULT_SPLIT if LEGACY_DEFAULT_SPLIT.exists() else (
+    DEFAULT_DATASET_DIR / "split_by_generalization_group.json"
+)
 sys.path.insert(0, os.path.join(MROOT, "model"))
 sys.path.insert(0, os.path.join(MROOT, "scripts"))
 
@@ -30,8 +33,10 @@ from architectures import MSECNet  # noqa: E402
 from util import config  # noqa: E402
 from train import (  # noqa: E402
     CapNormalDS,
+    aggregate_legacy_point_normals,
     aggregate_point_normals,
     collate_variable_points,
+    oriented_angular_error_deg,
     resolve_max_points,
     to_msecnet,
 )
@@ -66,17 +71,20 @@ def load_models(manifest_path):
 
 
 def summarize(rows):
-    errors = np.array([row["axis_error_deg"] for row in rows], dtype=np.float64)
+    errors = np.array([row.get("angular_error_deg", row["axis_error_deg"]) for row in rows], dtype=np.float64)
     return {
         "samples": int(len(rows)),
+        "mean_angular_error_deg": float(errors.mean()),
+        "median_angular_error_deg": float(np.median(errors)),
+        "acc10_pct": float((errors <= 10.0).mean() * 100.0),
+        # Kept for the existing read-only web report and prior integrations.
         "mean_axis_error_deg": float(errors.mean()),
         "median_axis_error_deg": float(np.median(errors)),
-        "acc10_pct": float((errors <= 10.0).mean() * 100.0),
     }
 
 
 @torch.no_grad()
-def infer(model, loader, device, file_names, model_by_file):
+def infer(model, loader, device, file_names, model_by_file, oriented):
     model.eval()
     rows = []
     sample_offset = 0
@@ -84,10 +92,17 @@ def infer(model, loader, device, file_names, model_by_file):
         coord, feat, offset = to_msecnet(
             coord.to(device, non_blocking=True), offset.to(device, non_blocking=True)
         )
-        mean_vector, normal = aggregate_point_normals(model(coord, feat, offset), counts)
+        point_vectors = model(coord, feat, offset)
+        if oriented:
+            mean_vector, normal, _ = aggregate_point_normals(point_vectors, counts)
+        else:
+            mean_vector, normal = aggregate_legacy_point_normals(point_vectors, counts)
         target = target.to(device, non_blocking=True)
-        cosine = (normal * target).sum(1).abs().clamp(0, 1)
-        errors = torch.rad2deg(torch.arccos(cosine))
+        if oriented:
+            errors = oriented_angular_error_deg(normal, target)
+        else:
+            cosine = (normal * target).sum(1).abs().clamp(0, 1)
+            errors = torch.rad2deg(torch.arccos(cosine))
         confidence = mean_vector.norm(dim=1)
         for batch_index in range(len(counts)):
             name = str(file_names[sample_offset + batch_index])
@@ -96,7 +111,9 @@ def infer(model, loader, device, file_names, model_by_file):
                 "car_model": model_by_file.get(name, ""),
                 "pred_normal": [float(v) for v in normal[batch_index].cpu().tolist()],
                 "target_normal": [float(v) for v in target[batch_index].cpu().tolist()],
+                "angular_error_deg": float(errors[batch_index].cpu()),
                 "axis_error_deg": float(errors[batch_index].cpu()),
+                "point_consensus": float(confidence[batch_index].cpu()) if oriented else None,
                 "mean_vector_norm": float(confidence[batch_index].cpu()),
             })
         sample_offset += len(counts)
@@ -124,12 +141,13 @@ def write_outputs(out_dir, metadata, rows):
         writer = csv.writer(f)
         writer.writerow([
             "file", "car_model", "pred_nx", "pred_ny", "pred_nz",
-            "target_nx", "target_ny", "target_nz", "axis_error_deg", "mean_vector_norm",
+            "target_nx", "target_ny", "target_nz", "angular_error_deg", "axis_error_deg",
+            "point_consensus", "mean_vector_norm",
         ])
         for row in rows:
             writer.writerow([
                 row["file"], row["car_model"], *row["pred_normal"], *row["target_normal"],
-                row["axis_error_deg"], row["mean_vector_norm"],
+                row["angular_error_deg"], row["axis_error_deg"], row["point_consensus"], row["mean_vector_norm"],
             ])
     return json_path, csv_path, report["summary"]
 
@@ -140,7 +158,7 @@ def main(argv=None):
     parser.add_argument("labels", type=Path, nargs="?", default=DEFAULT_DATASET_DIR / "labels_manual3d.npz")
     parser.add_argument("pcd_dir", type=Path, nargs="?", default=DEFAULT_DATASET_DIR / "clouds")
     parser.add_argument("--centers", type=Path, default=DEFAULT_DATASET_DIR / "anchors_manual3d.json")
-    parser.add_argument("--split", type=Path, default=DEFAULT_DATASET_DIR / "split_by_car_model.json")
+    parser.add_argument("--split", type=Path, default=DEFAULT_SPLIT)
     parser.add_argument("--split-name", choices=("train", "val", "test"), default="test")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=24)
@@ -167,6 +185,7 @@ def main(argv=None):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if "model" not in checkpoint:
         raise KeyError(f"{args.checkpoint} is missing model weights")
+    oriented = checkpoint.get("normal_convention") == "oriented_toward_camera"
     max_points = resolve_max_points(
         args.max_points, args.npoints, default=int(checkpoint.get("max_points", checkpoint.get("npoints", 1024)))
     )
@@ -178,7 +197,10 @@ def main(argv=None):
     with open(centers_path, encoding="utf-8") as f:
         centers = json.load(f)
     models = load_models(args.labels.parent / "manifest.jsonl")
-    dataset = CapNormalDS(files, normals, str(args.pcd_dir), max_points, False, centers, args.radius)
+    dataset = CapNormalDS(
+        files, normals, str(args.pcd_dir), max_points, False, centers, args.radius,
+        seed=checkpoint.get("seed") if oriented else None,
+    )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
                         pin_memory=args.device.startswith("cuda"), collate_fn=collate_variable_points)
 
@@ -186,9 +208,11 @@ def main(argv=None):
     cfg.num_classes = 3
     model = MSECNet(cfg).to(args.device)
     model.load_state_dict(checkpoint["model"], strict=True)
+    if not oriented:
+        print("checkpoint has no oriented-normal metadata; using legacy sign-invariant aggregation", flush=True)
     print(f"loaded checkpoint step={checkpoint.get('step', 'unknown')} max_points={max_points}", flush=True)
     print(f"infer split={args.split_name} samples={len(dataset)} batch_size={args.batch_size}", flush=True)
-    rows = infer(model, loader, args.device, files, models)
+    rows = infer(model, loader, args.device, files, models, oriented)
 
     out_dir = args.out or (args.checkpoint.parent / f"inference_{args.split_name}")
     metadata = {
@@ -201,12 +225,14 @@ def main(argv=None):
         "max_points": max_points,
         "radius": args.radius,
         "device": args.device,
+        "normal_convention": checkpoint.get("normal_convention", "legacy_sign_invariant"),
+        "aggregation": checkpoint.get("aggregation", "legacy_mean(raw_point_vectors)"),
     }
     json_path, csv_path, summary = write_outputs(out_dir, metadata, rows)
     print(
         "result "
-        f"mean={summary['mean_axis_error_deg']:.3f}deg "
-        f"median={summary['median_axis_error_deg']:.3f}deg "
+        f"mean={summary['mean_angular_error_deg']:.3f}deg "
+        f"median={summary['median_angular_error_deg']:.3f}deg "
         f"<=10deg={summary['acc10_pct']:.1f}%",
         flush=True,
     )
