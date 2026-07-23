@@ -74,7 +74,7 @@ conda run --no-capture-output -n point2normal python msecnet/train.py \
   --seed 20260722 \
   --early-stop-patience 100 \
   --snapshot-every 1000 \
-  --out msecnet/out/manual_pseudo_obb_oriented
+  --out manual_pseudo_obb_oriented_group_v1
 ```
 
 当前数据集共有 5,864 个样本：训练集 4,688，验证集 589，测试集 587。
@@ -105,3 +105,6 @@ conda run --no-capture-output -n point2normal python web_label/server.py \
 ```
 
 浏览器打开 `http://localhost:8766`。追加 `--focus-file FILE.npz` 可只查看一个样本。
+
+lsof -nP -iTCP:8766 -sTCP:LISTEN
+kill "$(lsof -t -iTCP:8766 -sTCP:LISTEN)"

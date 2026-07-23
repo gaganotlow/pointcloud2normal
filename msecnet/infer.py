@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MROOT = os.path.join(HERE, "MSECNet")
 PROJECT_ROOT = Path(HERE).parent
 DEFAULT_DATASET_DIR = PROJECT_ROOT / "data" / "msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb"
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "msecnet" / "out" / "ckpt_msecnet_v4_manual_pseudo_obb" / "best.pt"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "msecnet" / "out" / "manual_pseudo_obb_oriented_group_v1" / "best.pt"
 LEGACY_DEFAULT_SPLIT = DEFAULT_DATASET_DIR / "split_by_car_model.json"
 DEFAULT_SPLIT = LEGACY_DEFAULT_SPLIT if LEGACY_DEFAULT_SPLIT.exists() else (
     DEFAULT_DATASET_DIR / "split_by_generalization_group.json"

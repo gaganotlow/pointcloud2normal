@@ -185,6 +185,28 @@ def atomic_torch_save(payload, path):
     os.replace(tmp_path, path)
 
 
+def checkpoint_payload(model, step, metrics, args):
+    """Build the checkpoint format shared by initial and training validations."""
+    return {
+        "model": model.state_dict(),
+        "step": step,
+        "mean_err": metrics["mean_err"],
+        "median_err": metrics["median_err"],
+        "p10": metrics["acc10"],
+        "val_loss": metrics["loss"],
+        "point_consensus": metrics["point_consensus"],
+        "max_points": int(args.max_points),
+        "point_batch_mode": "variable_no_replacement",
+        "aug_deg": float(args.aug_deg),
+        "normal_convention": "oriented_toward_camera",
+        "aggregation": "normalize(mean(normalize(point_vectors)))",
+        "point_loss_weight": float(args.point_loss_weight),
+        "seed": int(args.seed),
+        "init_checkpoint": os.path.abspath(args.init_checkpoint) if args.init_checkpoint else None,
+        "finetune": bool(args.finetune),
+    }
+
+
 def write_run_metadata(out_dir, args, train_count, val_count):
     """Record settings that are needed to reproduce a checkpoint."""
     payload = {
@@ -374,7 +396,13 @@ def main():
     ap.add_argument("--inlier", type=float, default=0.8); ap.add_argument("--agree", type=float, default=15)
     ap.add_argument("--radius", type=float, default=0.3); ap.add_argument("--soft", action="store_true")
     ap.add_argument("--aug-deg", type=float, default=45.0)
-    ap.add_argument("--lr", type=float, default=5e-4); ap.add_argument("--val-every", type=int, default=100)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="peak learning rate (default: 5e-4; 5e-5 with --finetune)")
+    ap.add_argument("--init-checkpoint", default=None,
+                    help="checkpoint whose model weights initialize this run")
+    ap.add_argument("--finetune", action="store_true",
+                    help="require --init-checkpoint; reset optimizer and use cosine decay")
+    ap.add_argument("--val-every", type=int, default=100)
     ap.add_argument("--point-loss-weight", type=float, default=0.25,
                     help="weight of per-point loss; the remaining weight optimizes the pooled patch normal")
     ap.add_argument("--seed", type=int, default=20260722)
@@ -390,8 +418,15 @@ def main():
                     help="optional JSON with train/val file lists; use for car-model-disjoint validation")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt_msecnet"))
     a = ap.parse_args(); a.max_points = resolve_max_points(a.max_points, a.npoints)
+    if a.finetune and not a.init_checkpoint:
+        ap.error("--finetune requires --init-checkpoint")
+    if a.init_checkpoint and not os.path.isfile(a.init_checkpoint):
+        raise FileNotFoundError(a.init_checkpoint)
+    a.lr = a.lr if a.lr is not None else (5e-5 if a.finetune else 5e-4)
     if a.steps < 1 or a.bs < 1 or a.val_every < 1:
         raise ValueError("--steps, --bs, and --val-every must be positive")
+    if a.lr <= 0:
+        raise ValueError("--lr must be positive")
     if not 0 <= a.point_loss_weight <= 1:
         raise ValueError("--point-loss-weight must be in [0, 1]")
     if a.workers < 0 or a.val_workers < 0 or a.early_stop_patience < 0:
@@ -458,9 +493,41 @@ def main():
     cfg = config.load_cfg_from_cfg_file(os.path.join(MROOT, "scripts/config/pcpnet/config.yaml"))
     cfg.num_classes = 3
     model = MSECNet(cfg).to(dev)
+    if a.init_checkpoint:
+        init_checkpoint = torch.load(a.init_checkpoint, map_location="cpu", weights_only=False)
+        if "model" not in init_checkpoint:
+            raise KeyError(f"{a.init_checkpoint} is missing model weights")
+        model.load_state_dict(init_checkpoint["model"], strict=True)
+        print(
+            f"loaded initial model weights from {a.init_checkpoint} "
+            f"(checkpoint step={init_checkpoint.get('step', 'unknown')})",
+            flush=True,
+        )
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=a.steps, pct_start=0.05)
-    best = float("inf"); checks_without_improvement = 0; it = iter(tr); rl = 0.0; last_loss = 0.0
+    if a.finetune:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.steps, eta_min=a.lr / 100)
+        print(f"fine-tuning with fresh AdamW and cosine decay (lr={a.lr:.2e})", flush=True)
+    else:
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=a.steps, pct_start=0.05)
+    best = float("inf"); checks_without_improvement = 0; rl = 0.0; last_loss = 0.0
+
+    if a.finetune:
+        metrics = evaluate(model, va, dev, a.point_loss_weight)
+        initial_payload = checkpoint_payload(model, 0, metrics, a)
+        logger.log_val(0, metrics)
+        logger.plot_dashboard(0)
+        atomic_torch_save(initial_payload, os.path.join(a.out, "last.pt"))
+        atomic_torch_save(initial_payload, os.path.join(a.out, "best.pt"))
+        best = metrics["mean_err"]
+        print(
+            f"  [VAL step 0] mean_ang_err={metrics['mean_err']:.2f}deg "
+            f"median={metrics['median_err']:.2f}deg <=10deg:{metrics['acc10']:.0f}% "
+            f"consensus={metrics['point_consensus']:.3f} (val_loss {metrics['loss']:.4f})",
+            flush=True,
+        )
+        print(f"  -> saved starting best mean_ang_err {best:.2f}deg", flush=True)
+
+    it = iter(tr)
     import time as _t; t0 = _t.time()
     for step in range(1, a.steps + 1):
         try:
@@ -493,22 +560,7 @@ def main():
             )
             logger.log_val(step, metrics)
             logger.plot_dashboard(step)
-            ckpt_payload = {
-                "model": model.state_dict(),
-                "step": step,
-                "mean_err": metrics["mean_err"],
-                "median_err": metrics["median_err"],
-                "p10": metrics["acc10"],
-                "val_loss": metrics["loss"],
-                "point_consensus": metrics["point_consensus"],
-                "max_points": int(a.max_points),
-                "point_batch_mode": "variable_no_replacement",
-                "aug_deg": float(a.aug_deg),
-                "normal_convention": "oriented_toward_camera",
-                "aggregation": "normalize(mean(normalize(point_vectors)))",
-                "point_loss_weight": float(a.point_loss_weight),
-                "seed": int(a.seed),
-            }
+            ckpt_payload = checkpoint_payload(model, step, metrics, a)
             atomic_torch_save(ckpt_payload, os.path.join(a.out, "last.pt"))
             if is_snapshot_step:
                 snapshot_dir = os.path.join(a.out, "snapshots")
