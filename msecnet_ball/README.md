@@ -79,6 +79,42 @@ conda run --no-capture-output -n point2normal python msecnet_ball/infer.py \
 non-ball checkpoints.  Use the same `beta` for comparison experiments unless
 the ablation is intentional.
 
+## Web Viewer
+
+After test inference, show the read-only report in the browser. The viewer
+loads the prepared ball patch, original source context, target normal, and the
+ball-model prediction.
+
+```bash
+conda run --no-capture-output -n point2normal python web_label/server.py \
+  --msecnet-report msecnet_ball/out/center_ball_r08_oriented_9211_v1/inference_test/report.json \
+  --msecnet-dataset data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08 \
+  --msecnet-source-root data/fuelcap_pass_20260721_9211 \
+  --port 8766
+```
+
+Open `http://localhost:8766`. To choose pseudo-OBB or 8 cm ball checkpoints
+and launch matching inference from the browser, start the server with
+`--msecnet-ui` instead of `--msecnet-report`.
+
+## Unlabeled OBB Crops
+
+For unlabeled detector-OBB datasets, the ball predictor uses the OBB crop
+centroid only as a proxy 3D center. It then selects the 8 cm ball from the
+uncropped `source_cloud` PLY, matching the training geometry. This is an
+inference-time proxy, not a replacement for reviewed training centers.
+
+```bash
+conda run --no-capture-output -n point2normal python \
+  msecnet_ball/predict_unlabeled.py \
+  msecnet_ball/out/center_ball_r08_oriented_9211_v1/best.pt \
+  data/msecnet_20260730_open_obb10_unlabeled_test \
+  --source-root raw_data/20260730_五辆车外盖_多角度_三分类/open
+```
+
+The report contains predictions and aggregation strength only; no angular
+error is available because this dataset has no target normals.
+
 ## Visualize Random Balls
 
 Export ten deterministic random PLYs with gray source context, blue 8 cm ball

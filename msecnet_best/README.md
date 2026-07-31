@@ -161,27 +161,54 @@ conda run --no-capture-output -n point2normal python msecnet_best/infer.py \
 
 ## Web Visualize 9211 Test Predictions
 
-Launch the browser viewer for the held-out test split. The launcher runs the
-same inference command above, writes `report.json` under the checkpoint's
-`inference_test/` directory, and starts the read-only `web_label` viewer.
+Launch the online inference and visualization UI:
 
 ```bash
 cd /data2/shendu/code/ruoyu/train_point2normal
-bash web_label/launch_msecnet_test_viewer.sh
+bash shell/launch_msecnet_test_viewer.sh
 ```
 
-Open `http://127.0.0.1:8765` in a browser. In the viewer, the red arrow is the
-manual target normal and the orange arrow is the MSECNet prediction. The
-per-sample axial angle error is shown in the information panel. Because this
-legacy model is sign-invariant, the viewer displays the equivalent prediction
-direction nearest the target normal. This view is read-only and cannot change
-manual labels.
+Open `http://127.0.0.1:8765` in a browser. Select an available checkpoint,
+prepared dataset, and `train`, `val`, or `test` split in the toolbar, then
+click `开始推理`. The server runs one GPU inference job at a time and
+shows its live log in the toolbar. On completion, the result is loaded into the
+read-only viewer automatically.
 
-Pass a checkpoint and port to inspect another run or avoid a port conflict:
+In the viewer, the red arrow is the manual target normal and the orange arrow
+is the MSECNet prediction. The per-sample axial angle error is shown in the
+information panel. Because this legacy model is sign-invariant, the viewer
+displays the equivalent prediction direction nearest the target normal. This
+view cannot change manual labels. Each web inference report is saved below the
+selected checkpoint as `web_inference/DATASET/SPLIT/`.
+
+Use the left `取点` button to cycle between the MSECNet OBB crop, the raw
+source-cloud context within 0.5 m, and a sampled raw full point cloud.
+
+Pass a port to avoid a port conflict:
 
 ```bash
-bash web_label/launch_msecnet_test_viewer.sh PATH_TO_BEST_PT 8766
+bash shell/launch_msecnet_test_viewer.sh 8766
 ```
+
+## Prepare 20260730 Open Test Data
+
+Build an unlabeled test dataset from the aligned RGB and point-cloud captures.
+The fixed script runs the OBB detector, expands the rotated box width and
+height by 10 percent, projects the source point cloud through its camera
+intrinsics, and preserves points inside that expanded OBB.
+
+```bash
+cd /data2/shendu/code/ruoyu/train_point2normal
+bash shell/prepare_20260730_open_obb10_test.sh
+```
+
+It writes `data/msecnet_20260730_open_obb10_unlabeled_test/`. The dataset has
+only a `test` split and deliberately contains no target normals, so it produces
+predictions and aggregation strengths but no angular-error metrics. It appears
+as a selectable dataset in the Web viewer after the server is restarted. The
+two samples without a target OBB, along with all OBB and crop metadata, are
+recorded in `dataset.json`. Its predicted normals are oriented toward the
+camera in post-processing.
 
 ## Visualize a 9211 Pseudo-OBB Patch
 

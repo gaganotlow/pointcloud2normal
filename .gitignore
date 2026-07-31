@@ -19,6 +19,7 @@ dist/
 # ---- 数据集 (datasets, 都是指向外部的软链接) ----
 /data/
 /models
+raw_data/
 
 # ---- 训练结果 / 权重 (checkpoints & weights) ----
 ckpt*/

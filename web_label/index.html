@@ -25,6 +25,11 @@
   #flag{background:#7a4a1a;border-color:#a63}
   #leftbar{position:absolute;left:10px;top:102px;display:flex;flex-direction:column;gap:5px;z-index:5;width:172px}
   #leftbar button{width:100%;text-align:left}
+  #evalbar{position:absolute;left:10px;top:10px;z-index:8;display:flex;align-items:center;gap:7px;
+    padding:7px 9px;background:#16161ce8;border:1px solid #444;font-size:13px}
+  #evalbar select{max-width:280px;background:#25252e;color:#eee;border:1px solid #555;padding:6px}
+  #evalbar button{background:#1e6b43;border-color:#398b5c}
+  #jobstatus{max-width:420px;color:#c8d4df;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>
 <script type="importmap">
 {"imports":{
@@ -39,6 +44,13 @@
 <div id="loading"><div>⏳ 加载点云中…</div></div>
 <div id="imgs"><img id="src" title="原图(绿框=内盖)— 双击放大"><img id="photo" title="内盖裁剪重建 — 双击放大"></div>
 <div id="lightbox"><img></div>
+<div id="evalbar" hidden>
+  <label>权重 <select id="checkpoint"></select></label>
+  <label>数据集 <select id="dataset"></select></label>
+  <label>划分 <select id="split"></select></label>
+  <button id="runInference" title="在服务器 GPU 上运行所选测试集推理">开始推理</button>
+  <span id="jobstatus"></span>
+</div>
 <div id="info"></div>
 <div id="help">🔴规则(几何,可编辑) 🟠MSECNet 🟢MoGe深度图法向 | a/d上下张 | c=RGB视角 e=侧面 | 拖红环=改法向 | 蓝盘贴盖=准 | 方向键微调 | Ctrl+Z撤销 | r绕法向转 | 空格存 | x标异常</div>
 <div id="leftbar">
@@ -50,7 +62,7 @@
   <button id="color">配色: RGB / 高度</button>
   <button id="bigger">点大 +</button>
   <button id="smaller">点小 −</button>
-  <button id="patch">取点: 局部块/整盖/0.5m</button>
+  <button id="patch" title="切换 OBB、8 cm 球形和原始点云显示">取点: OBB 推理点云</button>
   <button id="rgbtoggle">隐藏/显示 RGB 图</button>
 </div>
 <div id="bar">
@@ -71,10 +83,21 @@ renderer.setPixelRatio(devicePixelRatio);
 const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0e0e12);
 const camera=new THREE.PerspectiveCamera(45,1,0.01,100); camera.position.set(0,0,2.2);
 let ptSize=0.012;   // default 2 notches smaller (0.02 /1.3 /1.3)
-let mode='sphere';  // 取点 默认: sphere(0.5m内全部点) | patch(局部盖面块) | whole(整盖)
-const MODES=['patch','whole','sphere'], MODENAME={patch:'局部盖面块',whole:'整盖',sphere:'0.5m内全部点'};
+let mode='inference_obb';
+const MODES=['inference_obb','inference_ball','sphere','whole'];
+const MODENAME={
+  inference_obb:'OBB 推理点云',
+  inference_ball:'8 cm 球形推理点云',
+  sphere:'原始点云 0.5m',
+  whole:'原始完整点云',
+};
 let spinning=false;  // 'r' = spin cap around its normal axis; correct normal => no wobble
-const orbit=new OrbitControls(camera,renderer.domElement); orbit.target.set(0,0,0);
+const orbit=new OrbitControls(camera,renderer.domElement);
+orbit.target.set(0,0,0);
+orbit.zoomToCursor=false;
+orbit.zoomSpeed=0.6;
+orbit.minDistance=0.8;
+orbit.maxDistance=8.0;
 scene.add(new THREE.AxesHelper(0.6));
 scene.add(new THREE.GridHelper(3,12,0x333344,0x222230));
 
@@ -142,14 +165,28 @@ function updateInfo(){
   const d=THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(n.dot(pre)))));
   const mr=cur.model_label?THREE.MathUtils.radToDeg(Math.acos(Math.min(1,Math.abs(new THREE.Vector3(cur.model_label[0],cur.model_label[1],cur.model_label[2]).normalize().dot(pre))))):null;
   const tierNames={clean:'干净',review:'复核',mid:'中档',rest:'无OBB',drop:'丢弃'};
-  const evalViewNames={'source_0.5m':'原始点云 0.5m',source_full:'原始完整点云',training_10cm_sphere:'训练局部球 10cm'};
+  const evalViewNames={
+    'source_0.5m':'原始点云 0.5m',
+    source_full:'原始完整点云',
+    obb_inference:'OBB 推理点云',
+    center_ball_inference:'8 cm 球形推理点云',
+    center_ball_unavailable:'8 cm 球形点云不可用，显示 OBB',
+    obb_crop:'OBB 局部块',
+    center_ball_patch:'8 cm 球形点云',
+  };
+  const actualInputNames={pseudo_obb:'OBB 点云',center_ball:'8 cm 球形点云'};
+  const actualInput=actualInputNames[cur.input_geometry]||'-';
   const evalInfo=cur.readonly
-    ? `测试集只读  车型=${cur.car_model||'-'}  显示=${evalViewNames[cur.mode]||cur.mode}\n🔴人工标签 ↔ 🟠MSECNet = ${cur.prediction_error_deg!=null?cur.prediction_error_deg.toFixed(2):mr?.toFixed(2)}°  聚合强度=${cur.quality!=null?cur.quality.toFixed(2):'-'}\n`
+    ? (cur.has_target===false
+      ? `无标签推理  显示=${evalViewNames[cur.mode]||cur.mode}\n当前权重实际输入=${actualInput}${cur.is_actual_input?' (当前显示)':' (可对比查看)'}  点数=${cur.npts}\n🟠MSECNet 聚合强度=${cur.quality!=null?cur.quality.toFixed(2):'-'}\n`
+      : `测试集只读  车型=${cur.car_model||'-'}  显示=${evalViewNames[cur.mode]||cur.mode}\n当前权重实际输入=${actualInput}${cur.is_actual_input?' (当前显示)':' (可对比查看)'}  点数=${cur.npts}\n🔴人工标签 ↔ 🟠MSECNet = ${cur.prediction_error_deg!=null?cur.prediction_error_deg.toFixed(2):mr?.toFixed(2)}°  聚合强度=${cur.quality!=null?cur.quality.toFixed(2):'-'}\n`)
     : `取点=${MODENAME[cur.mode]||cur.mode}  点数=${cur.npts}  内盖点=${cur.ninner}  档=${tierNames[cur.tier]||cur.tier||'-'}\n平面质量=${cur.quality!=null?cur.quality.toFixed(2):'-'}  🔴🟠模型↔规则=${mr!=null?mr.toFixed(0)+'°':'-'}\n`;
   document.getElementById('info').textContent=
     `[${idx+1}/${N}] ${cur.file.slice(0,36)}  ${cur.is_saved?'(已标注)':''}${cur.flagged?'⚠'+cur.flagged:''}\n`+
     evalInfo+
-    `法向 n=(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})  Δ预标=${d.toFixed(1)}°`;
+    (cur.has_target===false
+      ? `预测法向 n=(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})`
+      : `法向 n=(${n.x.toFixed(2)},${n.y.toFixed(2)},${n.z.toFixed(2)})  Δ预标=${d.toFixed(1)}°`);
   // progress in bottom status bar
   const pct=((idx+1)/N*100).toFixed(0);
   const lbl=cur.labeled_count||0;
@@ -169,6 +206,7 @@ async function load(i){
     posA[b]=f32[a];posA[b+1]=f32[a+1];posA[b+2]=f32[a+2];
     rgbC[b]=f32[a+3];rgbC[b+1]=f32[a+4];rgbC[b+2]=f32[a+5]; }
   idx=cur.i; N=cur.n; undo.length=0;
+  pivot.visible=cur.has_target!==false;
   tcontrol.enabled=!cur.readonly;
   document.getElementById('save').style.display=cur.readonly?'none':'';
   document.getElementById('flag').style.display=cur.readonly?'none':'';
@@ -228,7 +266,9 @@ document.getElementById('color').onclick=()=>{colorMode=colorMode==='rgb'?'heigh
 function setPt(s){ ptSize=Math.max(0.004,Math.min(0.08,s)); if(cloud) cloud.material.size=ptSize; }
 document.getElementById('bigger').onclick=()=>setPt(ptSize*1.3);
 document.getElementById('smaller').onclick=()=>setPt(ptSize/1.3);
-document.getElementById('patch').onclick=()=>{mode=MODES[(MODES.indexOf(mode)+1)%MODES.length]; load(idx);};
+function updatePointModeButton(){ document.getElementById('patch').textContent=`取点：${MODENAME[mode]}`; }
+updatePointModeButton();
+document.getElementById('patch').onclick=()=>{mode=MODES[(MODES.indexOf(mode)+1)%MODES.length]; updatePointModeButton(); load(idx);};
 async function flagBad(){ if(!cur) return;
   if(cur.readonly) return;
   await fetch('/api/flag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:cur.file,flag:'abnormal'})});
@@ -273,7 +313,86 @@ addEventListener('resize',resize); resize();
     camera.position.applyQuaternion(q); camera.up.applyQuaternion(q); camera.lookAt(0,0,0);
   } else orbit.update();
   renderer.render(scene,camera); })();
-load(0);
+function addOptions(element, values){
+  element.textContent='';
+  for(const item of values){ const option=document.createElement('option'); option.value=item.id; option.textContent=item.label; element.append(option); }
+}
+let evaluationOptions=null, loadedJobOutput='';
+const checkpointSelect=document.getElementById('checkpoint');
+const datasetSelect=document.getElementById('dataset');
+const splitSelect=document.getElementById('split');
+const runInference=document.getElementById('runInference');
+const jobStatus=document.getElementById('jobstatus');
+function populateSplits(){
+  const dataset=evaluationOptions.datasets.find(item=>item.id===datasetSelect.value);
+  addOptions(splitSelect,(dataset?.splits||[]).map(name=>({id:name,label:name})));
+}
+function populateCheckpoints(){
+  const dataset=evaluationOptions.datasets.find(item=>item.id===datasetSelect.value);
+  const modelTypes=dataset?.model_types||[dataset?.model_type];
+  const compatible=evaluationOptions.checkpoints.filter(item=>modelTypes.includes(item.model_type));
+  addOptions(checkpointSelect,compatible);
+  runInference.disabled=!compatible.length;
+}
+async function refreshViewer(){
+  const response=await fetch('/api/meta');
+  const meta=await response.json();
+  N=meta.n||0;
+  if(N){
+    if(meta.evaluation && meta.input_geometry){
+      mode=meta.input_geometry==='center_ball'?'inference_ball':'inference_obb';
+      updatePointModeButton();
+    }
+    await load(0);
+  }
+  else { document.getElementById('status').textContent='选择权重、数据集和划分后开始推理'; }
+}
+function renderJob(job){
+  const last=(job.logs||[]).at(-1)||'';
+  const summary=job.summary ? ` mean=${Number(job.summary.mean_axis_error_deg).toFixed(3)} deg` : '';
+  jobStatus.textContent=`${job.state||'idle'}${summary}${last?`: ${last}`:''}`;
+  jobStatus.title=(job.logs||[]).join('\n');
+  runInference.disabled=job.state==='running';
+}
+async function pollJob(){
+  const response=await fetch('/api/msecnet/job');
+  if(!response.ok) return;
+  const job=await response.json(); renderJob(job);
+  if(job.state==='complete' && job.output_dir && loadedJobOutput!==job.output_dir){
+    loadedJobOutput=job.output_dir; await refreshViewer();
+  }
+  if(job.state==='running') setTimeout(pollJob,1000);
+}
+async function setupOnlineEvaluation(){
+  const response=await fetch('/api/msecnet/options');
+  if(!response.ok){ await refreshViewer(); return; }
+  evaluationOptions=await response.json();
+  if(!evaluationOptions.checkpoints.length || !evaluationOptions.datasets.length){
+    jobStatus.textContent='未找到可用权重或完整准备数据集'; return;
+  }
+  document.getElementById('evalbar').hidden=false;
+  document.getElementById('info').style.top='56px';
+  document.getElementById('leftbar').style.top='148px';
+  addOptions(datasetSelect,evaluationOptions.datasets);
+  const initialDataset=evaluationOptions.datasets.find(dataset=>
+    evaluationOptions.checkpoints.some(checkpoint=>(dataset.model_types||[dataset.model_type]).includes(checkpoint.model_type)));
+  if(initialDataset) datasetSelect.value=initialDataset.id;
+  populateCheckpoints();
+  populateSplits();
+  datasetSelect.onchange=()=>{ populateCheckpoints(); populateSplits(); };
+  runInference.onclick=async()=>{
+    loadedJobOutput='';
+    const response=await fetch('/api/msecnet/job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      checkpoint:checkpointSelect.value,dataset:datasetSelect.value,split:splitSelect.value,
+    })});
+    const job=await response.json();
+    if(!response.ok){ jobStatus.textContent=`错误: ${job.error||response.statusText}`; return; }
+    renderJob(job); pollJob();
+  };
+  await refreshViewer();
+  pollJob();
+}
+setupOnlineEvaluation();
 </script>
 </body>
 </html>

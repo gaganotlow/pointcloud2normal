@@ -10,13 +10,16 @@ import base64
 import glob
 import json
 import os
+import subprocess
 import struct
 import sys
+import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -65,11 +68,17 @@ FLAG = os.path.join(ROOT, "output", "flagged.json")
 SRC_DIR = arg_value("--src-dir") or os.environ.get("SRC_DIR", os.path.join(ROOT, "data", "yolo_seg_by_car"))
 EVAL_REPORT_PATH = arg_value("--msecnet-report")
 EVAL_DATASET_DIR = arg_value("--msecnet-dataset")
-EVAL_MODE = bool(EVAL_REPORT_PATH)
+MSECNET_UI_MODE = "--msecnet-ui" in sys.argv
+EVAL_MODE = bool(EVAL_REPORT_PATH) or MSECNET_UI_MODE
 EVAL_ROWS = {}
 EVAL_ANCHORS = {}
 EVAL_SOURCE_PATHS = {}
 EVAL_ORIENTED = False
+EVAL_HAS_TARGET = False
+EVAL_BALL_RADIUS = None
+DISPLAY_BALL_RADIUS_M = 0.08
+EVAL_STATE_LOCK = threading.RLock()
+INFERENCE_JOB = {"state": "idle", "logs": []}
 
 
 def report_consensus(row):
@@ -84,7 +93,7 @@ def report_error(row):
 os.makedirs(os.path.join(ROOT, "output"), exist_ok=True)
 
 # ---- load labels ----
-L = np.load(LBL) if os.path.exists(LBL) else None
+L = None if EVAL_MODE else (np.load(LBL) if os.path.exists(LBL) else None)
 if L is None and not EVAL_MODE:
     print("ERROR: normal_labels_full.npz not found. Generate labels first.", flush=True)
     sys.exit(1)
@@ -190,37 +199,45 @@ if FOCUS_FILE:
         print(f"WARNING: FOCUS_FILE not found in labeling queue: {focus_base}", flush=True)
 
 # Manual-3D MSECNet evaluation viewer. This keeps the original labeler mode unchanged.
-if EVAL_MODE:
-    if not EVAL_DATASET_DIR:
-        raise ValueError("--msecnet-dataset is required with --msecnet-report")
-    if not os.path.isfile(EVAL_REPORT_PATH):
-        raise FileNotFoundError(EVAL_REPORT_PATH)
-    if not os.path.isdir(EVAL_DATASET_DIR):
-        raise NotADirectoryError(EVAL_DATASET_DIR)
-    report = json.load(open(EVAL_REPORT_PATH, encoding="utf-8"))
+def configure_evaluation(report_path, dataset_dir, source_root=None):
+    """Load one completed infer.py report as the current read-only web view."""
+    global PCD, FILES, NORMS, CONF, AGREE, NINNER, TIER, PROD, MOGE
+    global EVAL_ROWS, EVAL_ANCHORS, EVAL_SOURCE_PATHS, EVAL_ORIENTED, EVAL_HAS_TARGET, EVAL_BALL_RADIUS
+    if not os.path.isfile(report_path):
+        raise FileNotFoundError(report_path)
+    if not os.path.isdir(dataset_dir):
+        raise NotADirectoryError(dataset_dir)
+    report = json.load(open(report_path, encoding="utf-8"))
     rows = report.get("predictions") if isinstance(report, dict) else None
     if not isinstance(rows, list) or not rows:
-        raise ValueError(f"{EVAL_REPORT_PATH} has no prediction rows")
-    required = {"file", "pred_normal", "target_normal", "axis_error_deg"}
+        raise ValueError(f"{report_path} has no prediction rows")
+    required = {"file", "pred_normal"}
     if any(not required.issubset(row) for row in rows):
-        raise ValueError(f"{EVAL_REPORT_PATH} has incomplete prediction rows")
+        raise ValueError(f"{report_path} has incomplete prediction rows")
+    EVAL_HAS_TARGET = all("target_normal" in row and "axis_error_deg" in row for row in rows)
     EVAL_ROWS = {row["file"]: row for row in rows}
     EVAL_ORIENTED = report.get("metadata", {}).get("normal_convention") == "oriented_toward_camera"
-    EVAL_ANCHORS = json.load(open(os.path.join(EVAL_DATASET_DIR, "anchors_manual3d.json"), encoding="utf-8"))
-    source_root = arg_value("--msecnet-source-root") or os.path.join(
-        os.path.dirname(EVAL_DATASET_DIR), "fuelcap_pass_20260717_5873"
+    EVAL_BALL_RADIUS = report.get("metadata", {}).get("ball_radius_m")
+    if EVAL_BALL_RADIUS is not None:
+        EVAL_BALL_RADIUS = float(EVAL_BALL_RADIUS)
+    anchors_path = next(
+        (os.path.join(dataset_dir, name) for name in ("anchors_manual3d.json", "anchors_obb.json")
+         if os.path.isfile(os.path.join(dataset_dir, name))),
+        None,
     )
-    manifest_path = os.path.join(EVAL_DATASET_DIR, "manifest.jsonl")
+    EVAL_ANCHORS = json.load(open(anchors_path, encoding="utf-8")) if anchors_path else {}
+    source_root = source_root or os.path.join(os.path.dirname(dataset_dir), "fuelcap_pass_20260717_5873")
+    manifest_path = os.path.join(dataset_dir, "manifest.jsonl")
     manifest = [json.loads(line) for line in open(manifest_path, encoding="utf-8") if line.strip()]
     EVAL_SOURCE_PATHS = {
         item["file"]: os.path.join(source_root, item["source_cloud"])
         for item in manifest if item["file"] in EVAL_ROWS
     }
-    PCD = os.path.join(EVAL_DATASET_DIR, "clouds")
+    PCD = os.path.join(dataset_dir, "clouds")
     FILES = [row["file"] for row in rows]
-    NORMS = [row["target_normal"] for row in rows]
+    NORMS = [row.get("target_normal", row["pred_normal"]) for row in rows]
     CONF = [report_consensus(row) for row in rows]
-    AGREE = [report_error(row) for row in rows]
+    AGREE = [report_error(row) if EVAL_HAS_TARGET else 0.0 for row in rows]
     NINNER = [0] * len(rows)
     TIER = {row["file"]: "test" for row in rows}
     PROD = {row["file"]: {"normal": row["pred_normal"]} for row in rows}
@@ -232,11 +249,22 @@ if EVAL_MODE:
         if focus_base not in EVAL_ROWS:
             raise ValueError(f"--focus-file is absent from report: {focus_base}")
         FILES = [focus_base]
-        NORMS = [EVAL_ROWS[focus_base]["target_normal"]]
+        NORMS = [EVAL_ROWS[focus_base].get("target_normal", EVAL_ROWS[focus_base]["pred_normal"])]
         CONF = [report_consensus(EVAL_ROWS[focus_base])]
-        AGREE = [report_error(EVAL_ROWS[focus_base])]
+        AGREE = [report_error(EVAL_ROWS[focus_base]) if EVAL_HAS_TARGET else 0.0]
         NINNER = [0]
-    print(f"MSECNet evaluation viewer: {len(FILES)} samples from {os.path.basename(EVAL_REPORT_PATH)}", flush=True)
+    print(f"MSECNet evaluation viewer: {len(FILES)} samples from {os.path.basename(report_path)}", flush=True)
+    return report.get("summary", {})
+
+
+if EVAL_REPORT_PATH:
+    if not EVAL_DATASET_DIR:
+        raise ValueError("--msecnet-dataset is required with --msecnet-report")
+    configure_evaluation(
+        EVAL_REPORT_PATH,
+        EVAL_DATASET_DIR,
+        arg_value("--msecnet-source-root") or None,
+    )
 
 # index source images by basename
 SRC = {}
@@ -320,8 +348,14 @@ def full_cloud_path(f, timeout=_FC_TIMEOUT):
 
 _NPZ_LRU = {}
 _NPZ_ORDER = []
+_PLY_LRU = {}
+_PLY_ORDER = []
 _META_LRU = {}
 _META_ORDER = []
+PLY_DTYPES = {
+    "char": "i1", "uchar": "u1", "short": "i2", "ushort": "u2",
+    "int": "i4", "uint": "u4", "float": "f4", "double": "f8",
+}
 
 
 def load_npz(path):
@@ -335,6 +369,45 @@ def load_npz(path):
     return d
 
 
+def load_ply(path):
+    """Load XYZ and optional RGB from a standard binary little-endian PLY."""
+    cached = _PLY_LRU.get(path)
+    if cached is not None:
+        return cached
+    with open(path, "rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError(f"not a PLY file: {path}")
+        vertex_count, properties, in_vertex = None, [], False
+        while True:
+            line = f.readline().decode("ascii").strip()
+            if line == "end_header":
+                break
+            fields = line.split()
+            if fields[:2] == ["element", "vertex"]:
+                vertex_count, in_vertex = int(fields[2]), True
+            elif fields[:1] == ["element"]:
+                in_vertex = False
+            elif in_vertex and fields[:1] == ["property"]:
+                if len(fields) != 3 or fields[1] not in PLY_DTYPES:
+                    raise ValueError(f"unsupported PLY vertex property: {line}")
+                properties.append((fields[2], "<" + PLY_DTYPES[fields[1]]))
+        if vertex_count is None or not {"x", "y", "z"}.issubset(dict(properties)):
+            raise ValueError(f"PLY has no XYZ vertex fields: {path}")
+        vertices = np.fromfile(f, dtype=np.dtype(properties), count=vertex_count)
+    data = {"xyz": np.column_stack((vertices["x"], vertices["y"], vertices["z"])).astype(np.float32)}
+    if {"red", "green", "blue"}.issubset(vertices.dtype.names):
+        data["rgb"] = np.column_stack((vertices["red"], vertices["green"], vertices["blue"])).astype(np.float32) / 255.0
+    _PLY_LRU[path] = data
+    _PLY_ORDER.append(path)
+    if len(_PLY_ORDER) > 2:
+        _PLY_LRU.pop(_PLY_ORDER.pop(0), None)
+    return data
+
+
+def load_source_cloud(path):
+    return load_ply(path) if path.lower().endswith(".ply") else load_npz(path)
+
+
 app = Flask(__name__, static_folder=None)
 
 
@@ -344,6 +417,202 @@ def labels():
 
 def flagged():
     return json.load(open(FLAG)) if os.path.exists(FLAG) else {}
+
+
+def available_evaluation_options():
+    """Return repository-owned checkpoints and compatible prepared datasets."""
+    project_root = Path(ROOT)
+    checkpoints = []
+    for path in sorted((project_root / "msecnet_best").glob("out/*/best.pt")):
+        checkpoints.append({
+            "id": str(path.relative_to(project_root)),
+            "label": f"pseudo-OBB: {path.parent.name}",
+            "model_type": "pseudo_obb",
+        })
+    bundled = project_root / "msecnet_best" / "checkpoints" / "best.pt"
+    if bundled.is_file():
+        checkpoints.append({
+            "id": str(bundled.relative_to(project_root)),
+            "label": "pseudo-OBB: bundled historical best",
+            "model_type": "pseudo_obb",
+        })
+    for path in sorted((project_root / "msecnet_ball" / "out").glob("*/best.pt")):
+        checkpoints.append({
+            "id": str(path.relative_to(project_root)),
+            "label": f"8 cm ball: {path.parent.name}",
+            "model_type": "center_ball",
+        })
+
+    datasets = []
+    source_candidates = list((project_root / "data").glob("fuelcap_pass_*"))
+    source_candidates.extend((project_root / "raw_data").glob("*/open"))
+    for path in sorted((project_root / "data").iterdir()):
+        labeled_required = ("labels_manual3d.npz", "clouds", "anchors_manual3d.json", "manifest.jsonl")
+        unlabeled_required = ("unlabeled_test.npz", "clouds", "anchors_obb.json", "split.json", "manifest.jsonl")
+        is_labeled = path.is_dir() and all((path / name).exists() for name in labeled_required)
+        is_unlabeled = path.is_dir() and all((path / name).exists() for name in unlabeled_required)
+        split_by_car_model = path / "split_by_car_model.json"
+        split_by_group = path / "split_by_generalization_group.json"
+        if is_labeled and split_by_car_model.is_file():
+            model_type, model_types, split_path = "pseudo_obb", ("pseudo_obb",), split_by_car_model
+        elif is_labeled and split_by_group.is_file():
+            anchors = json.loads((path / "anchors_manual3d.json").read_text(encoding="utf-8"))
+            selection = next(iter(anchors.values()), {}).get("selection")
+            if selection != "manual_center_ball_patch":
+                continue
+            model_type, model_types, split_path = "center_ball", ("center_ball",), split_by_group
+        elif is_unlabeled:
+            # A detector-derived OBB crop has no reviewed 3D center. The ball
+            # predictor uses its crop centroid as the requested proxy center.
+            model_type, model_types, split_path = "pseudo_obb", ("pseudo_obb", "center_ball"), path / "split.json"
+        else:
+            continue
+        manifest = [json.loads(line) for line in (path / "manifest.jsonl").read_text(encoding="utf-8").splitlines() if line]
+        if not manifest:
+            continue
+        source_cloud = manifest[0].get("source_cloud", "")
+        source_root = next(
+            (candidate for candidate in sorted(source_candidates)
+             if (candidate / source_cloud).is_file()),
+            None,
+        )
+        split = json.loads(split_path.read_text(encoding="utf-8"))
+        splits = [name for name in ("train", "val", "test") if split.get(name)]
+        if splits:
+            datasets.append({
+                "id": path.name,
+                "label": f"unlabeled OBB: {path.name}" if is_unlabeled else path.name,
+                "splits": splits,
+                "source_root": str(source_root) if source_root else "",
+                "kind": "labeled" if is_labeled else "unlabeled",
+                "model_type": model_type,
+                "model_types": list(model_types),
+            })
+    supported_model_types = {item["model_type"] for item in checkpoints}
+    datasets = [item for item in datasets if item["model_type"] in supported_model_types]
+    return {"checkpoints": checkpoints, "datasets": datasets}
+
+
+def current_job():
+    with EVAL_STATE_LOCK:
+        job = dict(INFERENCE_JOB)
+        job["logs"] = list(INFERENCE_JOB.get("logs", [])[-80:])
+        return job
+
+
+def append_job_log(message):
+    with EVAL_STATE_LOCK:
+        logs = INFERENCE_JOB.setdefault("logs", [])
+        logs.append(str(message).rstrip()[:1200])
+        del logs[:-200]
+
+
+def run_inference_job(command, report_path, dataset_dir, source_root):
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        with EVAL_STATE_LOCK:
+            INFERENCE_JOB["pid"] = process.pid
+        for line in process.stdout:
+            append_job_log(line)
+        if process.wait() != 0:
+            raise RuntimeError(f"infer.py exited with status {process.returncode}")
+        with EVAL_STATE_LOCK:
+            summary = configure_evaluation(str(report_path), str(dataset_dir), str(source_root))
+            INFERENCE_JOB.update({"state": "complete", "summary": summary, "pid": None})
+        append_job_log("Inference completed. The viewer now shows this result.")
+    except Exception as exc:
+        append_job_log(f"ERROR: {exc}")
+        with EVAL_STATE_LOCK:
+            INFERENCE_JOB.update({"state": "failed", "error": str(exc), "pid": None})
+
+
+@app.route("/api/msecnet/options")
+def msecnet_options():
+    if not MSECNET_UI_MODE:
+        abort(404)
+    return jsonify(available_evaluation_options())
+
+
+@app.route("/api/msecnet/job")
+def msecnet_job():
+    if not MSECNET_UI_MODE:
+        abort(404)
+    return jsonify(current_job())
+
+
+@app.route("/api/msecnet/job", methods=["POST"])
+def start_msecnet_job():
+    if not MSECNET_UI_MODE:
+        abort(404)
+    request_data = request.get_json(silent=True) or {}
+    options = available_evaluation_options()
+    checkpoint_by_id = {item["id"]: item for item in options["checkpoints"]}
+    dataset_by_id = {item["id"]: item for item in options["datasets"]}
+    checkpoint_id = request_data.get("checkpoint")
+    dataset_id = request_data.get("dataset")
+    split_name = request_data.get("split")
+    if checkpoint_id not in checkpoint_by_id or dataset_id not in dataset_by_id:
+        return jsonify({"error": "unknown checkpoint or dataset"}), 400
+    dataset = dataset_by_id[dataset_id]
+    if split_name not in dataset["splits"]:
+        return jsonify({"error": "unknown or empty split"}), 400
+    checkpoint_type = checkpoint_by_id[checkpoint_id]["model_type"]
+    if checkpoint_type not in dataset.get("model_types", [dataset["model_type"]]):
+        return jsonify({"error": "checkpoint and dataset use different input definitions"}), 400
+
+    checkpoint = Path(ROOT) / checkpoint_id
+    dataset_dir = Path(ROOT) / "data" / dataset_id
+    source_root = Path(dataset["source_root"]) if dataset["source_root"] else dataset_dir
+    output_dir = checkpoint.parent / "web_inference" / dataset_id / split_name
+    if dataset["kind"] == "unlabeled" and checkpoint_type == "center_ball":
+        if not dataset["source_root"]:
+            return jsonify({"error": "ball inference needs the original source-cloud directory"}), 400
+        command = [
+            sys.executable, "-u", str(Path(ROOT) / "msecnet_ball" / "predict_unlabeled.py"),
+            str(checkpoint), str(dataset_dir), "--source-root", str(source_root), "--out", str(output_dir),
+        ]
+    elif dataset["kind"] == "unlabeled":
+        command = [
+            sys.executable, "-u", str(Path(ROOT) / "msecnet_best" / "predict_unlabeled.py"),
+            str(checkpoint), str(dataset_dir), "--out", str(output_dir),
+        ]
+    elif checkpoint_type == "center_ball":
+        command = [
+            sys.executable, "-u", str(Path(ROOT) / "msecnet_ball" / "infer.py"),
+            str(checkpoint), str(dataset_dir / "labels_manual3d.npz"), str(dataset_dir / "clouds"),
+            "--centers", str(dataset_dir / "anchors_manual3d.json"),
+            "--split", str(dataset_dir / "split_by_generalization_group.json"),
+            "--split-name", split_name, "--out", str(output_dir),
+        ]
+    elif dataset["kind"] == "labeled":
+        command = [
+            sys.executable, "-u", str(Path(ROOT) / "msecnet_best" / "infer.py"),
+            str(checkpoint), str(dataset_dir / "labels_manual3d.npz"), str(dataset_dir / "clouds"),
+            "--centers", str(dataset_dir / "anchors_manual3d.json"),
+            "--split", str(dataset_dir / "split_by_car_model.json"),
+            "--split-name", split_name, "--out", str(output_dir),
+        ]
+    with EVAL_STATE_LOCK:
+        if INFERENCE_JOB.get("state") == "running":
+            return jsonify({"error": "an inference job is already running"}), 409
+        INFERENCE_JOB.clear()
+        INFERENCE_JOB.update({
+            "state": "running", "checkpoint": checkpoint_id, "dataset": dataset_id,
+            "split": split_name, "output_dir": str(output_dir), "logs": ["Starting infer.py..."],
+        })
+    threading.Thread(
+        target=run_inference_job,
+        args=(command, output_dir / "report.json", dataset_dir, source_root),
+        daemon=True,
+    ).start()
+    return jsonify(current_job()), 202
 
 
 def make_photo(xyz, rgb, inner, K, W, H, S=512):
@@ -368,44 +637,84 @@ def make_photo(xyz, rgb, inner, K, W, H, S=512):
 
 
 def evaluation_cloud(i):
-    """Serve a source or training cloud and its Manual-3D prediction/target pair."""
+    """Serve explicit OBB/ball inference inputs or a larger source-cloud context."""
     f = FILES[i]
     row = EVAL_ROWS[f]
     training_cloud = load_npz(os.path.join(PCD, f))
     training_xyz = training_cloud["xyz"].astype(np.float32)
     anchor = EVAL_ANCHORS.get(f, {})
-    center = np.asarray(anchor.get("center_3d", np.median(training_xyz, axis=0)), dtype=np.float32)
-    mode = request.args.get("mode", "sphere")
+    center = np.asarray(
+        row.get("center_3d", anchor.get("center_3d", np.median(training_xyz, axis=0))), dtype=np.float32
+    )
+    mode = request.args.get("mode", "inference_obb")
+    input_geometry = "center_ball" if EVAL_BALL_RADIUS is not None else "pseudo_obb"
+    ball_radius_m = EVAL_BALL_RADIUS or DISPLAY_BALL_RADIUS_M
+    # Keep the previous URL working while making the two model input views explicit.
+    if mode == "patch":
+        mode = "inference_ball" if input_geometry == "center_ball" else "inference_obb"
     source_path = EVAL_SOURCE_PATHS.get(f)
     if mode in ("whole", "sphere") and source_path and os.path.isfile(source_path):
-        source_cloud = load_npz(source_path)
-        xyz = source_cloud["xyz"].astype(np.float32)
+        source_cloud = load_source_cloud(source_path)
+        source_xyz = source_cloud["xyz"].astype(np.float32)
+        keep = np.ones(len(source_xyz), dtype=bool)
         if mode == "sphere":
-            keep = np.linalg.norm(xyz - center, axis=1) < 0.5
+            keep = np.linalg.norm(source_xyz - center, axis=1) < 0.5
             if keep.sum() >= 80:
-                xyz = xyz[keep]
+                source_xyz = source_xyz[keep]
+            else:
+                keep = np.ones(len(source_xyz), dtype=bool)
+        xyz = source_xyz
         source_rgb = source_cloud.get("rgb")
         if source_rgb is None:
             rgb = np.tile(np.asarray((0.62, 0.72, 0.88), dtype=np.float32), (len(xyz), 1))
         else:
-            rgb = source_rgb[:len(source_cloud["xyz"])].astype(np.float32)
-            if mode == "sphere" and len(rgb) != len(xyz):
-                rgb = source_rgb[keep].astype(np.float32)
+            rgb = source_rgb[keep].astype(np.float32)
             if rgb.max() > 1.0:
                 rgb /= 255.0
+        max_display_points = 120000 if mode == "whole" else 160000
+        if len(xyz) > max_display_points:
+            indices = np.random.default_rng(0).choice(len(xyz), max_display_points, replace=False)
+            xyz, rgb = xyz[indices], rgb[indices]
         mode_name = "source_0.5m" if mode == "sphere" else "source_full"
+    elif mode == "inference_ball":
+        # The OBB crop supplies the proxy center for unlabeled data, but the
+        # actual ball model input comes from the uncropped source point cloud.
+        if source_path and os.path.isfile(source_path):
+            source_cloud = load_source_cloud(source_path)
+            source_xyz = source_cloud["xyz"].astype(np.float32)
+            ball_mask = np.linalg.norm(source_xyz - center, axis=1) <= ball_radius_m
+            xyz = source_xyz[ball_mask]
+            source_rgb = source_cloud.get("rgb")
+            if source_rgb is None:
+                rgb = np.tile(np.asarray((0.62, 0.72, 0.88), dtype=np.float32), (len(xyz), 1))
+            else:
+                rgb = source_rgb[ball_mask].astype(np.float32)
+                if rgb.max() > 1.0:
+                    rgb /= 255.0
+        else:
+            xyz = np.empty((0, 3), dtype=np.float32)
+        if not len(xyz):
+            # Do not silently present an OBB crop as a ball-model input.
+            xyz = training_xyz
+            rgb = np.tile(np.asarray((0.62, 0.72, 0.88), dtype=np.float32), (len(xyz), 1))
+            mode_name = "center_ball_unavailable"
+        else:
+            mode_name = "center_ball_inference"
     else:
+        # The prepared cloud is the pseudo-OBB model input. It is also useful as
+        # a comparison view beside the ball subset for a center-ball prediction.
         xyz = training_xyz
         rgb = np.tile(np.asarray((0.62, 0.72, 0.88), dtype=np.float32), (len(xyz), 1))
-        mode_name = "training_10cm_sphere"
+        mode_name = "obb_inference"
     scale = float(np.percentile(np.linalg.norm(xyz - center, axis=1), 97) + 1e-9)
     pts = ((xyz - center) / scale) * np.array([1, -1, -1], dtype=np.float32)
-    target = np.asarray(row["target_normal"], dtype=np.float32)
+    has_target = "target_normal" in row
+    target = np.asarray(row["target_normal"] if has_target else row["pred_normal"], dtype=np.float32)
     prediction = np.asarray(row["pred_normal"], dtype=np.float32)
     target /= np.linalg.norm(target) + 1e-9
     prediction /= np.linalg.norm(prediction) + 1e-9
     # Legacy reports were sign-invariant; new reports preserve this visible orientation.
-    if not EVAL_ORIENTED and float(prediction @ target) < 0:
+    if has_target and not EVAL_ORIENTED and float(prediction @ target) < 0:
         prediction = -prediction
     rect = None
     if "rectangle_wh_m" in anchor:
@@ -418,12 +727,16 @@ def evaluation_cloud(i):
     header = {
         "i": i, "n": len(FILES), "file": f, "conf": CONF[i], "agree": AGREE[i], "ninner": len(training_xyz),
         "labeled_count": 0, "tier": "test", "has_src": False, "mode": mode_name,
-        "npts": int(len(pts)), "fullcloud": False, "flagged": None, "knob_rect": rect,
-        "quality": report_consensus(row), "v3_agree": report_error(row),
+        "npts": int(len(pts)), "fullcloud": mode == "whole", "flagged": None, "knob_rect": rect,
+        "input_geometry": input_geometry,
+        "is_actual_input": (mode == "inference_obb" and input_geometry == "pseudo_obb")
+        or (mode == "inference_ball" and input_geometry == "center_ball"),
+        "ball_radius_m": ball_radius_m,
+        "quality": report_consensus(row), "v3_agree": report_error(row) if has_target else None,
         "normal": _flipYZ(target), "prelabel": _flipYZ(target),
         "model_label": _flipYZ(prediction), "moge_label": None, "is_saved": False, "photo": "",
         "readonly": True, "car_model": row.get("car_model", ""),
-        "prediction_error_deg": report_error(row),
+        "has_target": has_target, "prediction_error_deg": report_error(row) if has_target else None,
     }
     inter = np.empty((len(pts), 6), np.float32)
     inter[:, :3] = pts; inter[:, 3:] = rgb
@@ -444,13 +757,22 @@ def vendor(p):
 
 @app.route("/api/meta")
 def meta():
-    return jsonify({"n": len(FILES), "labeled": list(labels().keys())})
+    input_geometry = "center_ball" if EVAL_BALL_RADIUS is not None else "pseudo_obb"
+    return jsonify({
+        "n": len(FILES), "labeled": list(labels().keys()), "evaluation": EVAL_MODE,
+        "input_geometry": input_geometry if EVAL_MODE and FILES else None,
+    })
 
 
 @app.route("/api/cloud/<int:i>")
 def cloud(i):
     if EVAL_MODE:
-        return evaluation_cloud(i)
+        with EVAL_STATE_LOCK:
+            if i < 0 or i >= len(FILES):
+                abort(404, "no completed inference result is loaded")
+            return evaluation_cloud(i)
+    if i < 0 or i >= len(FILES):
+        abort(404)
     f = FILES[i]
     fc = full_cloud_path(f)
     d = load_npz(fc if fc else os.path.join(PCD, f))
@@ -460,6 +782,10 @@ def cloud(i):
     W, H = int(d["w"]), int(d["h"])
     cap_xyz = xa[inner]; cap_rgb = ra[inner]
     mode = request.args.get("mode", "patch")
+    # The explicit inference views apply to read-only MSECNet evaluation. Keep
+    # the original labeler behavior unchanged when this page is used for edits.
+    if mode in ("inference_obb", "inference_ball"):
+        mode = "patch"
     kc = knob_centers().get(f)
     # --- per-cloud meta ---
     meta = _META_LRU.get(f)
