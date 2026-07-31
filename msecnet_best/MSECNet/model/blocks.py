@@ -194,11 +194,8 @@ class Downsampling(nn.Module):
     def forward(self, p, x, o):
         identity = x
 
-        n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
-        for i in range(1, o.shape[0]):
-            count += (o[i].item() - o[i-1].item()) // self.stride
-            n_o.append(count)
-        n_o = torch.cuda.IntTensor(n_o)
+        counts = torch.diff(torch.cat((o.new_zeros(1), o)))
+        n_o = torch.cumsum(torch.div(counts, self.stride, rounding_mode='floor'), dim=0).to(torch.int32)
         idx = pointops.furthestsampling(p, o, n_o)  # (m)
         n_p = p[idx.long(), :]  # (m, 3)
         
@@ -245,5 +242,4 @@ class EdgeConditioning(nn.Module):
         self.conditioning = lambda x,y: x + self.concat_fusion(torch.cat([x,y], dim=1)) 
     def forward(self, x, edge):
         return self.conditioning(x, edge) 
-
 
