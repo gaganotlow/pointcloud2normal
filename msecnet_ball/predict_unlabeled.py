@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent
-MROOT = PROJECT_ROOT / "msecnet" / "MSECNet"
+MROOT = PROJECT_ROOT / "msecnet_best" / "MSECNet"
 sys.path.insert(0, str(MROOT / "model"))
 sys.path.insert(0, str(MROOT / "scripts"))
 

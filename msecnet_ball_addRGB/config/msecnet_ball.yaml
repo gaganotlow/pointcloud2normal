@@ -1,0 +1,22 @@
+DATA:
+  data_name: pcpnet
+  d_in_initial: 1 # normalized point-to-center distance r in [0, 1]
+  d_out_initial: 64
+  num_classes: 0
+  points_per_patch: 700
+  strides: [2, 2, 2]
+  nsample_conv: 16
+  nsample: 16
+  nsample_side: 9
+  nsample_interp: 3
+  interp_weight_type: spatial
+  n_scale: 4
+  d_fusion: 1024
+  side_transform_block: residual_fusion
+  side_transform: pointnet2/pointwise_mlp
+  edge_detector: adaptive_laplacian
+Model:
+  architecture: [simple, residual, downsample, residual, residual, downsample, residual, residual, downsample, residual, residual, upsample, upsample, upsample]
+  convolution: pointnet2
+  decoder_out_dim: 128
+  bottleneck_ratio: 4

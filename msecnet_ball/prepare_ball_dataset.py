@@ -232,7 +232,7 @@ def main():
         f"Each cloud is pre-sampled to at most {args.max_points} points. train.py consumes this prepared patch directly.",
         "",
         "Train with:",
-        "python msecnet/train.py DATASET/labels_manual3d.npz DATASET/clouds "
+        "python msecnet_ball/train.py DATASET/labels_manual3d.npz DATASET/clouds "
         "--centers DATASET/anchors_manual3d.json --split DATASET/split_by_generalization_group.json",
         "",
     ])

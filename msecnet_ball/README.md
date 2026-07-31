@@ -1,8 +1,9 @@
 # MSECNet Center-Ball Normal Estimation
 
 This is an isolated experiment for estimating the camera-oriented normal at a
-reviewed human 3D center from an 8 cm radius point-cloud ball.  It does not
-modify or share checkpoints with `msecnet/`.
+reviewed human 3D center from an 8 cm radius point-cloud ball. It reuses the
+maintained MSECNet implementation and CUDA pointops extension in
+`msecnet_best/MSECNet/`, but does not share checkpoints with that experiment.
 
 For every sample, preparation selects all source points satisfying
 `||point - center_3d|| <= 0.08 m`.  Training then uses:
@@ -60,7 +61,7 @@ conda run --no-capture-output -n point2normal python \
 ```
 
 The extra one-dimensional input makes the model weights incompatible with the
-zero-feature `msecnet/` checkpoints, so this experiment must train from
+zero-feature pseudo-OBB checkpoints, so this experiment must train from
 scratch.
 
 ## Evaluate

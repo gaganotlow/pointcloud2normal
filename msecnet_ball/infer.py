@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = Path(HERE).parent
-MROOT = os.path.join(PROJECT_ROOT, "msecnet", "MSECNet")
+MROOT = os.path.join(PROJECT_ROOT, "msecnet_best", "MSECNet")
 DEFAULT_DATASET_DIR = PROJECT_ROOT / "data" / "msecnet_ball_v1_fuelcap_pass_20260717_manual3d_r08"
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "msecnet_ball" / "out" / "center_ball_r08_oriented_v1" / "best.pt"
 DEFAULT_SPLIT = DEFAULT_DATASET_DIR / "split_by_generalization_group.json"

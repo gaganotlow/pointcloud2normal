@@ -28,7 +28,9 @@ from torch.utils.data import DataLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-MROOT = os.path.join(ROOT, "msecnet", "MSECNet")
+# The standalone ball experiment shares the maintained MSECNet implementation
+# and compiled pointops extension with the historical pseudo-OBB baseline.
+MROOT = os.path.join(ROOT, "msecnet_best", "MSECNet")
 sys.path.insert(0, os.path.join(MROOT, "model"))     # 'blocks'
 sys.path.insert(0, os.path.join(MROOT, "scripts"))   # 'lib' (pointops), 'util'
 from util import config                              # noqa: E402
