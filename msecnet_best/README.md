@@ -91,8 +91,8 @@ car-model-disjoint `split_by_car_model.json` for the legacy training objective.
 ```bash
 conda run --no-capture-output -n point2normal python \
   msecnet_best/prepare_pseudo_obb_dataset.py \
-  data/fuelcap_pass_20260721_9211 \
-  data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb \
+  data/fuelcap_pass_20260803_10847 \
+  data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb \
   --max-points 4096 \
   --obb-expand 2.0 \
   --obb-half-depth-m 0.005
@@ -100,15 +100,9 @@ conda run --no-capture-output -n point2normal python \
 
 ## Historical Checkpoint Reference
 
-written to `msecnet_best/checkpoints/inference_test/` unless `--out` is given.
-The bundled checkpoint was trained on the earlier 5873-sample dataset. Its
-default inference command intentionally continues to evaluate that historical
-dataset and is only a reference baseline:
-written to `msecnet_best/checkpoints/inference_test/` unless `--out` is given.
-
-```bash
-conda run --no-capture-output -n point2normal python msecnet_best/infer.py
-```
+The bundled checkpoint was trained on the earlier 5873-sample dataset and is
+kept only as an artifact reference. It must not be used to train or select a
+current model. The current default inference paths target the 10847 run below.
 
 Equivalent explicit historical command:
 
@@ -122,44 +116,44 @@ conda run --no-capture-output -n point2normal python msecnet_best/infer.py \
   --split-name test
 ```
 
-## Train on the 9211 Dataset
+## Train on the 10847 Dataset
 
 This preserves the historical sign-invariant objective while training on the
-newly prepared 9211-source pseudo-OBB dataset. A fresh run is not bit-for-bit
+newly prepared 10847-source pseudo-OBB dataset. A fresh run is not bit-for-bit
 deterministic because the historical script uses time-based training sampling.
 
 ```bash
 conda run --no-capture-output -n point2normal python msecnet_best/train.py \
-  data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/labels_manual3d.npz \
-  data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/clouds \
-  --centers data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/anchors_manual3d.json \
-  --split data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/split_by_car_model.json \
+  data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/labels_manual3d.npz \
+  data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/clouds \
+  --centers data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/anchors_manual3d.json \
+  --split data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/split_by_car_model.json \
   --steps 70000 --bs 24 --max-points 1024 \
   --radius 0.3 --aug-deg 45 \
   --snapshot-every 1000 \
-  --out msecnet_best/out/pseudo_obb_9211_legacy_v1
+  --out msecnet_best/out/pseudo_obb_20260803_v1
 ```
 
 Important historical settings encoded in the checkpoint are `max_points=1024`,
 `aug_deg=45`, variable-size point batches, and the loss
 `1 - dot(normalize(point_prediction), target)^2`.
 
-## Test the 9211 Checkpoint
+## Test the 10847 Checkpoint
 
-After training, evaluate only the held-out 9211 test split. The report and CSV
+After training, evaluate only the held-out 10847 test split. The report and CSV
 are written under the new checkpoint directory.
 
 ```bash
 conda run --no-capture-output -n point2normal python msecnet_best/infer.py \
-  msecnet_best/out/pseudo_obb_9211_legacy_v1/best.pt \
-  data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/labels_manual3d.npz \
-  data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/clouds \
-  --centers data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/anchors_manual3d.json \
-  --split data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb/split_by_car_model.json \
+  msecnet_best/out/pseudo_obb_20260803_v1/best.pt \
+  data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/labels_manual3d.npz \
+  data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/clouds \
+  --centers data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/anchors_manual3d.json \
+  --split data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb/split_by_car_model.json \
   --split-name test
 ```
 
-## Web Visualize 9211 Test Predictions
+## Web Visualize 10847 Test Predictions
 
 Launch the online inference and visualization UI:
 
@@ -210,7 +204,7 @@ two samples without a target OBB, along with all OBB and crop metadata, are
 recorded in `dataset.json`. Its predicted normals are oriented toward the
 camera in post-processing.
 
-## Visualize a 9211 Pseudo-OBB Patch
+## Visualize a 10847 Pseudo-OBB Patch
 
 This exports a PLY containing gray source context, blue training points, and a
 yellow target normal. Omit `--file` to export the first validation sample.
@@ -218,8 +212,8 @@ yellow target normal. Omit `--file` to export the first validation sample.
 ```bash
 conda run --no-capture-output -n point2normal python \
   msecnet_best/export_pseudo_obb_ply.py \
-  data/msecnet_best_fuelcap_pass_20260721_9211_manual3d_pseudo_obb \
-  --source-root data/fuelcap_pass_20260721_9211 \
+  data/msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb \
+  --source-root data/fuelcap_pass_20260803_10847 \
   --raw-points 50000
 ```
 

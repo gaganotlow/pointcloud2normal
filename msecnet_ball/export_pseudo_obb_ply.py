@@ -124,7 +124,7 @@ def main():
         selected_indices = np.random.default_rng(args.seed).choice(len(candidates), args.random_count, replace=False)
         selected_rows = [candidates[int(index)] for index in selected_indices]
 
-    source_root = args.source_root or (dataset_dir.parent / "fuelcap_pass_20260717_5873")
+    source_root = args.source_root or (dataset_dir.parent / "fuelcap_pass_20260803_10847")
     out_dir = args.out_dir or (dataset_dir / "visualizations" / f"random_ball_seed_{args.seed}")
     out_dir.mkdir(parents=True, exist_ok=True)
     index = []

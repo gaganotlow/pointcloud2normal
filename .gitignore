@@ -17,7 +17,8 @@ dist/
 .ninja_log
 
 # ---- 数据集 (datasets, 都是指向外部的软链接) ----
-/data/
+/data/*
+!/data/readme.md
 /models
 raw_data/
 
@@ -53,3 +54,7 @@ manual_normals.json
 *.swp
 .vscode/
 .idea/
+
+
+# 实验
+/msecnet_ball_addRGB/

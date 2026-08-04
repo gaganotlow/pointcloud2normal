@@ -13,6 +13,7 @@ import random
 import os
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 try:
@@ -40,10 +41,35 @@ import json                                          # noqa: E402
 
 
 NORMAL_EPS = 1e-6
+ACTIVE_SOURCE_DATASET = "fuelcap_pass_20260803_10847"
 METRIC_COLUMNS = (
     "step", "train_loss", "lr", "val_loss", "val_mean_ang_err",
     "val_median_ang_err", "val_acc10_pct", "val_point_consensus",
 )
+
+
+def require_active_ball_dataset(labels_path, pcd_dir, centers_path, split_path):
+    """Reject accidental training on a superseded prepared dataset."""
+    dataset_dir = Path(labels_path).resolve().parent
+    expected_paths = (
+        dataset_dir / "labels_manual3d.npz",
+        dataset_dir / "clouds",
+        dataset_dir / "anchors_manual3d.json",
+        dataset_dir / "split_by_generalization_group.json",
+    )
+    if tuple(Path(path).resolve() for path in (labels_path, pcd_dir, centers_path, split_path)) != tuple(
+        path.resolve() for path in expected_paths
+    ):
+        raise ValueError("labels, clouds, centers, and split must belong to one prepared center-ball dataset")
+    metadata_path = dataset_dir / "dataset.json"
+    if not metadata_path.is_file():
+        raise ValueError(f"{dataset_dir} has no dataset.json provenance; prepare it from {ACTIVE_SOURCE_DATASET}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("kind") != "center_ball" or metadata.get("source_dataset") != ACTIVE_SOURCE_DATASET:
+        raise ValueError(
+            f"training only accepts center-ball data prepared from {ACTIVE_SOURCE_DATASET}; "
+            f"got {metadata.get('source_dataset')!r}"
+        )
 
 
 def rand_rot(rs, max_deg=180.0):
@@ -203,6 +229,7 @@ def checkpoint_payload(model, step, metrics, args):
         "radial_feature": "r = clamp(norm((point - center) / ball_radius_m), 0, 1)",
         "radial_weight_beta": float(args.radial_weight_beta),
         "seed": int(args.seed),
+        "source_dataset": ACTIVE_SOURCE_DATASET,
         "init_checkpoint": os.path.abspath(args.init_checkpoint) if args.init_checkpoint else None,
         "finetune": bool(args.finetune),
     }
@@ -217,6 +244,7 @@ def write_run_metadata(out_dir, args, train_count, val_count):
         "ball_radius_m": args.ball_radius_m,
         "radial_feature": "r = clamp(norm((point - center) / ball_radius_m), 0, 1)",
         "radial_weight_beta": args.radial_weight_beta,
+        "source_dataset": ACTIVE_SOURCE_DATASET,
         "loss": {
             "patch": "1 - dot(patch_normal, target)",
             "point": "1 - dot(point_normal, target)",
@@ -450,6 +478,9 @@ def main():
         raise FileNotFoundError("labels and pcd_dir must exist")
     if not os.path.isfile(a.centers):
         raise FileNotFoundError(a.centers)
+    if not a.split:
+        raise ValueError("--split is required for the active 10847 training protocol")
+    require_active_ball_dataset(a.labels, a.pcd_dir, a.centers, a.split)
     seed_everything(a.seed)
     os.makedirs(a.out, exist_ok=True); dev = "cuda"
     logger = TrainLogger(a.out)
@@ -510,6 +541,11 @@ def main():
         init_checkpoint = torch.load(a.init_checkpoint, map_location="cpu", weights_only=False)
         if "model" not in init_checkpoint:
             raise KeyError(f"{a.init_checkpoint} is missing model weights")
+        if init_checkpoint.get("source_dataset") != ACTIVE_SOURCE_DATASET:
+            raise ValueError(
+                f"--init-checkpoint must have been trained on {ACTIVE_SOURCE_DATASET}; "
+                f"got {init_checkpoint.get('source_dataset')!r}"
+            )
         model.load_state_dict(init_checkpoint["model"], strict=True)
         print(
             f"loaded initial model weights from {a.init_checkpoint} "

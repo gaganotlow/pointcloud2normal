@@ -259,6 +259,19 @@ def main():
     split["seed"] = args.seed
     split["model_split"] = model_split
     write_json(out_dir / "split_by_car_model.json", split)
+    write_json(out_dir / "dataset.json", {
+        "schema": "msecnet_prepared_dataset_v1",
+        "kind": "pseudo_obb",
+        "source_dataset": source_root.name,
+        "source_root": str(source_root),
+        "source_samples": len(rows),
+        "samples": len(selected),
+        "obb_expand": args.obb_expand,
+        "obb_half_depth_m": args.obb_half_depth_m,
+        "min_cap_points": args.min_cap_points,
+        "pre_sample_max_points": args.max_points,
+        "seed": args.seed,
+    })
     with open(out_dir / "manifest.jsonl", "w", encoding="utf-8") as f:
         for row in manifest:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -267,13 +280,14 @@ def main():
     readme = "\n".join([
         "# MSECNet Manual Pseudo-OBB Dataset",
         "",
-        "Prepared exclusively from fuelcap_pass_20260717_5873.",
+        f"Prepared exclusively from {source_root.name}.",
         "",
         "- clouds/: local 3D prisms selected by the reviewed human pseudo OBB, uniformly pre-sampled to at most 4096 points.",
         "- Source label==1 and knob_obb are deliberately not used to build the input patch.",
         "- labels_manual3d.npz: human normal targets for MSECNet training.",
         "- anchors_manual3d.json: records pseudo-OBB provenance and the human normal target.",
         "- split_by_car_model.json: car-model-disjoint train/val/test split.",
+        "- dataset.json: preparation parameters and source-dataset provenance.",
         "- manifest.jsonl: source traceability for every retained cloud.",
         "",
         f"Retained samples: {len(selected)}",
@@ -283,7 +297,7 @@ def main():
         f"Each cloud is pre-sampled to at most {args.max_points} points. train.py consumes this prepared patch directly.",
         "",
         "Train with:",
-        "python msecnet/train.py DATASET/labels_manual3d.npz DATASET/clouds "
+        "python msecnet_best/train.py DATASET/labels_manual3d.npz DATASET/clouds "
         "--centers DATASET/anchors_manual3d.json --split DATASET/split_by_car_model.json",
         "",
     ])

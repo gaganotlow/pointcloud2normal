@@ -69,7 +69,7 @@ def main():
     else:
         row_index, row = next((i, item) for i, item in enumerate(rows) if item["file"] == args.file)
 
-    source_root = args.source_root or (dataset_dir.parent / "fuelcap_pass_20260717_5873")
+    source_root = args.source_root or (dataset_dir.parent / "fuelcap_pass_20260803_10847")
     source_path = source_root / row["source_cloud"]
     training_path = dataset_dir / "clouds" / row["file"]
     if not source_path.is_file() or not training_path.is_file():

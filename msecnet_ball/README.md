@@ -29,24 +29,25 @@ cd /data2/shendu/code/ruoyu/train_point2normal
 
 conda run --no-capture-output -n point2normal python \
   msecnet_ball/prepare_ball_dataset.py \
-  data/fuelcap_pass_20260721_9211 \
-  data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08 \
+  data/fuelcap_pass_20260803_10847 \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08 \
   --ball-radius-m 0.08 \
   --max-points 4096
 ```
 
-The preparation output retains the existing group-disjoint train/validation/test
-split, but all `clouds/*.npz` files are newly produced spherical patches.
+The active dataset has 10,846 samples (one 3 m-depth outlier excluded) with a
+group-disjoint split of train 8,676 / val 1,085 / test 1,085. All
+`clouds/*.npz` files are newly produced spherical patches from the 10847 source.
 
 ## Train
 
 ```bash
 conda run --no-capture-output -n point2normal python \
   msecnet_ball/train.py \
-  data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/labels_manual3d.npz \
-  data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/clouds \
-  --centers data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/anchors_manual3d.json \
-  --split data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/split_by_generalization_group.json \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/labels_manual3d.npz \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/clouds \
+  --centers data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/anchors_manual3d.json \
+  --split data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/split_by_generalization_group.json \
   --ball-radius-m 0.08 \
   --radial-weight-beta 2.0 \
   --steps 70000 \
@@ -57,7 +58,7 @@ conda run --no-capture-output -n point2normal python \
   --seed 20260722 \
   --early-stop-patience 100 \
   --snapshot-every 1000 \
-  --out msecnet_ball/out/center_ball_r08_oriented_9211_v1
+  --out msecnet_ball/out/center_ball_r08_oriented_20260803_v1
 ```
 
 The extra one-dimensional input makes the model weights incompatible with the
@@ -68,11 +69,11 @@ scratch.
 
 ```bash
 conda run --no-capture-output -n point2normal python msecnet_ball/infer.py \
-  msecnet_ball/out/center_ball_r08_oriented_9211_v1/best.pt \
-  data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/labels_manual3d.npz \
-  data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/clouds \
-  --centers data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/anchors_manual3d.json \
-  --split data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08/split_by_generalization_group.json \
+  msecnet_ball/out/center_ball_r08_oriented_20260803_v1/best.pt \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/labels_manual3d.npz \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/clouds \
+  --centers data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/anchors_manual3d.json \
+  --split data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/split_by_generalization_group.json \
   --split-name test
 ```
 
@@ -88,9 +89,9 @@ ball-model prediction.
 
 ```bash
 conda run --no-capture-output -n point2normal python web_label/server.py \
-  --msecnet-report msecnet_ball/out/center_ball_r08_oriented_9211_v1/inference_test/report.json \
-  --msecnet-dataset data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08 \
-  --msecnet-source-root data/fuelcap_pass_20260721_9211 \
+  --msecnet-report msecnet_ball/out/center_ball_r08_oriented_20260803_v1/inference_test/report.json \
+  --msecnet-dataset data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08 \
+  --msecnet-source-root data/fuelcap_pass_20260803_10847 \
   --port 8766
 ```
 
@@ -108,7 +109,7 @@ inference-time proxy, not a replacement for reviewed training centers.
 ```bash
 conda run --no-capture-output -n point2normal python \
   msecnet_ball/predict_unlabeled.py \
-  msecnet_ball/out/center_ball_r08_oriented_9211_v1/best.pt \
+  msecnet_ball/out/center_ball_r08_oriented_20260803_v1/best.pt \
   data/msecnet_20260730_open_obb10_unlabeled_test \
   --source-root raw_data/20260730_五辆车外盖_多角度_三分类/open
 ```
@@ -124,8 +125,8 @@ points, and the yellow human target normal:
 ```bash
 conda run --no-capture-output -n point2normal python \
   msecnet_ball/export_pseudo_obb_ply.py \
-  data/msecnet_ball_v1_fuelcap_pass_20260721_9211_manual3d_r08 \
-  --source-root data/fuelcap_pass_20260721_9211 \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08 \
+  --source-root data/fuelcap_pass_20260803_10847 \
   --random-count 10 \
   --seed 20260723 \
   --raw-points 50000

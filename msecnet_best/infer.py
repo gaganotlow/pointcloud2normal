@@ -21,8 +21,8 @@ from torch.utils.data import DataLoader
 HERE = os.path.dirname(os.path.abspath(__file__))
 MROOT = os.path.join(HERE, "MSECNet")
 PROJECT_ROOT = Path(HERE).parent
-DEFAULT_DATASET_DIR = PROJECT_ROOT / "data" / "msecnet_v4_fuelcap_pass_20260717_manual3d_pseudo_obb"
-DEFAULT_CHECKPOINT = Path(HERE) / "checkpoints" / "best.pt"
+DEFAULT_DATASET_DIR = PROJECT_ROOT / "data" / "msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb"
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "msecnet_best" / "out" / "pseudo_obb_20260803_v1" / "best.pt"
 sys.path.insert(0, os.path.join(MROOT, "model"))
 sys.path.insert(0, os.path.join(MROOT, "scripts"))
 

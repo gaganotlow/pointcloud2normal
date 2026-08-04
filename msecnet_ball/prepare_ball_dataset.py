@@ -208,6 +208,18 @@ def main():
     write_json(out_dir / "anchors_manual3d.json", anchors)
     split.update(split_metadata)
     write_json(out_dir / "split_by_generalization_group.json", split)
+    write_json(out_dir / "dataset.json", {
+        "schema": "msecnet_prepared_dataset_v1",
+        "kind": "center_ball",
+        "source_dataset": source_root.name,
+        "source_root": str(source_root),
+        "source_samples": len(rows),
+        "samples": len(selected),
+        "ball_radius_m": args.ball_radius_m,
+        "min_ball_points": args.min_ball_points,
+        "pre_sample_max_points": args.max_points,
+        "seed": args.seed,
+    })
     with open(out_dir / "manifest.jsonl", "w", encoding="utf-8") as f:
         for row in manifest:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -216,13 +228,14 @@ def main():
     readme = "\n".join([
         "# MSECNet Center-Ball Dataset",
         "",
-        "Prepared exclusively from fuelcap_pass_20260717_5873.",
+        f"Prepared exclusively from {source_root.name}.",
         "",
         "- clouds/: local 3D balls centered at the reviewed human center, uniformly pre-sampled to at most 4096 points.",
         "- Source label==1 and knob_obb are deliberately not used to build the input patch.",
         "- labels_manual3d.npz: normal target at each human sphere center.",
         "- anchors_manual3d.json: sphere center, radius, provenance and target normal.",
         "- split_by_generalization_group.json: group-disjoint, sample-balanced train/val/test split.",
+        "- dataset.json: preparation parameters and source-dataset provenance.",
         "- manifest.jsonl: source traceability for every retained cloud.",
         "",
         f"Retained samples: {len(selected)}",

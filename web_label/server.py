@@ -226,7 +226,7 @@ def configure_evaluation(report_path, dataset_dir, source_root=None):
         None,
     )
     EVAL_ANCHORS = json.load(open(anchors_path, encoding="utf-8")) if anchors_path else {}
-    source_root = source_root or os.path.join(os.path.dirname(dataset_dir), "fuelcap_pass_20260717_5873")
+    source_root = source_root or os.path.join(os.path.dirname(dataset_dir), "fuelcap_pass_20260803_10847")
     manifest_path = os.path.join(dataset_dir, "manifest.jsonl")
     manifest = [json.loads(line) for line in open(manifest_path, encoding="utf-8") if line.strip()]
     EVAL_SOURCE_PATHS = {

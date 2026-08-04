@@ -10,6 +10,7 @@ import csv
 import os
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 try:
@@ -41,6 +42,31 @@ METRIC_COLUMNS = (
     "step", "train_loss", "lr", "val_mean_ang_err",
     "val_median_ang_err", "val_acc10_pct",
 )
+ACTIVE_SOURCE_DATASET = "fuelcap_pass_20260803_10847"
+
+
+def require_active_pseudo_obb_dataset(labels_path, pcd_dir, centers_path, split_path):
+    """Reject accidental training on a superseded prepared dataset."""
+    dataset_dir = Path(labels_path).resolve().parent
+    expected_paths = (
+        dataset_dir / "labels_manual3d.npz",
+        dataset_dir / "clouds",
+        dataset_dir / "anchors_manual3d.json",
+        dataset_dir / "split_by_car_model.json",
+    )
+    if tuple(Path(path).resolve() for path in (labels_path, pcd_dir, centers_path, split_path)) != tuple(
+        path.resolve() for path in expected_paths
+    ):
+        raise ValueError("labels, clouds, centers, and split must belong to one prepared pseudo-OBB dataset")
+    metadata_path = dataset_dir / "dataset.json"
+    if not metadata_path.is_file():
+        raise ValueError(f"{dataset_dir} has no dataset.json provenance; prepare it from {ACTIVE_SOURCE_DATASET}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("kind") != "pseudo_obb" or metadata.get("source_dataset") != ACTIVE_SOURCE_DATASET:
+        raise ValueError(
+            f"training only accepts pseudo-OBB data prepared from {ACTIVE_SOURCE_DATASET}; "
+            f"got {metadata.get('source_dataset')!r}"
+        )
 
 
 def rand_rot(rs, max_deg=180.0):
@@ -275,6 +301,7 @@ def write_run_metadata(out_dir, args, train_count, val_count):
     """Record the settings required to interpret a historical training run."""
     payload = {
         "normal_convention": "sign_invariant",
+        "source_dataset": ACTIVE_SOURCE_DATASET,
         "aggregation": "normalize(mean(raw_point_vectors))",
         "loss": "1 - dot(normalize(point_prediction), target)^2",
         "train_samples": int(train_count),
@@ -305,6 +332,9 @@ def main():
                     help="optional JSON with train/val file lists; use for car-model-disjoint validation")
     ap.add_argument("--out", default=os.path.join(HERE, "ckpt_msecnet"))
     a = ap.parse_args(); a.max_points = resolve_max_points(a.max_points, a.npoints)
+    if not a.split:
+        raise ValueError("--split is required for the active 10847 training protocol")
+    require_active_pseudo_obb_dataset(a.labels, a.pcd_dir, a.centers, a.split)
     os.makedirs(a.out, exist_ok=True); dev = "cuda"
     logger = TrainLogger(a.out)
 
@@ -392,6 +422,7 @@ def main():
                 "max_points": int(a.max_points),
                 "point_batch_mode": "variable_no_replacement",
                 "aug_deg": float(a.aug_deg),
+                "source_dataset": ACTIVE_SOURCE_DATASET,
             }
             torch.save(ckpt_payload, os.path.join(a.out, "last.pt"))
             if is_snapshot_step:
