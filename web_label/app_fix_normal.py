@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Review and repair normal labels after MSECNet inference.
 
-This app directly updates ``labels_manual3d.npz`` in the selected prepared
-dataset.  ``normal_fixes.json`` records the original and current values of
-each correction with its review context.
+This app keeps the normal target in both prepared-dataset representations in
+sync: ``labels_manual3d.npz`` is used by training, while
+``anchors_manual3d.json`` retains the editable 3D annotation and its pose.
+``normal_fixes.json`` records the original and current values of each
+correction with its review context.
 
 Run from the project root with the point2normal environment:
     conda run --no-capture-output -n point2normal python web_label/app_fix_normal.py
@@ -144,6 +146,55 @@ def load_label_archive(path: Path) -> dict[str, np.ndarray]:
 def load_normal_map(path: Path) -> dict[str, np.ndarray]:
     archive = load_label_archive(path)
     return {str(file_name): normalized(normal) for file_name, normal in zip(archive["files"], archive["normal"])}
+
+
+def updated_anchor(anchor: dict, corrected_normal: np.ndarray) -> dict:
+    """Return an anchor whose normal, tangent, and pose agree exactly.
+
+    ``pose_T`` stores a right-handed frame as [tangent, normal x tangent,
+    normal].  Merely replacing ``anchor[\"normal\"]`` leaves a stale pose and
+    makes the prepared data invalid when it is regenerated, so rebuild the
+    frame while retaining the old tangent direction as closely as possible.
+    """
+    if not isinstance(anchor, dict):
+        raise ValueError("anchor must be an object")
+    try:
+        center = np.asarray(anchor["center_3d"], dtype=np.float64)
+        tangent_hint = np.asarray(anchor["tangent"], dtype=np.float64)
+        pose = np.asarray(anchor["pose_T"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("anchor is missing center_3d, tangent, or pose_T") from exc
+    if center.shape != (3,) or not np.all(np.isfinite(center)):
+        raise ValueError("anchor center_3d must contain three finite values")
+    if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+        raise ValueError("anchor pose_T must be a finite 4x4 matrix")
+
+    normal = normalized(corrected_normal)
+    if np.linalg.norm(center) >= 1e-8 and float(np.dot(normal, -center)) <= 0:
+        raise ValueError("corrected normal must face the camera")
+    # Preserve the roll convention of the manual rectangle.  If the stored
+    # tangent is degenerate after projection, use the old pose x-axis and then
+    # a deterministic world axis as a last resort.
+    for candidate in (tangent_hint, pose[:3, 0], np.array((1.0, 0.0, 0.0)), np.array((0.0, 1.0, 0.0))):
+        tangent = candidate - normal * float(np.dot(candidate, normal))
+        if np.linalg.norm(tangent) >= 1e-8:
+            tangent = normalized(tangent)
+            break
+    else:  # pragma: no cover - a unit normal always has an orthogonal world axis
+        raise ValueError("cannot construct a tangent for corrected normal")
+    bitangent = normalized(np.cross(normal, tangent))
+
+    result = dict(anchor)
+    result["normal"] = normal.tolist()
+    result["tangent"] = tangent.tolist()
+    pose = pose.copy()
+    pose[:3, 0] = tangent
+    pose[:3, 1] = bitangent
+    pose[:3, 2] = normal
+    pose[:3, 3] = center
+    pose[3] = (0.0, 0.0, 0.0, 1.0)
+    result["pose_T"] = pose.tolist()
+    return result
 
 
 def prepared_datasets() -> list[dict]:
@@ -309,7 +360,12 @@ def update_repaired_label(
     corrected_normal: np.ndarray,
     review: dict,
 ) -> int:
-    """Atomically update the selected dataset labels and their audit entry."""
+    """Synchronize NPZ, anchor JSON, and audit data for one reviewed sample.
+
+    Every individual file is written via atomic replacement.  All validation
+    and serialization happens before replacing either source of truth, so a
+    normal UI save cannot leave a half-built anchor frame behind.
+    """
     labels_source = original_labels_path(dataset_dir)
     arrays = load_label_archive(labels_source)
     names = [str(value) for value in arrays["files"]]
@@ -320,7 +376,12 @@ def update_repaired_label(
     normals = arrays["normal"].copy()
     normals[index] = corrected_normal.astype(normals.dtype, copy=False)
     arrays["normal"] = normals
-    atomic_write_npz(labels_source, arrays)
+
+    anchors_path = dataset_dir / "anchors_manual3d.json"
+    anchors = load_anchors(dataset_dir)
+    if file_name not in anchors:
+        raise ValueError(f"{file_name} is absent from {anchors_path.name}")
+    anchors[file_name] = updated_anchor(anchors[file_name], corrected_normal)
 
     audit_file = fixes_path(dataset_dir)
     if audit_file.is_file():
@@ -343,6 +404,13 @@ def update_repaired_label(
         review = dict(review)
         review["history"] = history[-50:]
     fixes[file_name] = review
+    fixes[file_name]["anchors_synchronized"] = True
+
+    # Training consumes the NPZ; regeneration and visual inspection consume
+    # anchors.  Update both on the same Save action, then append its audit
+    # entry only after the two canonical representations are in sync.
+    atomic_write_npz(labels_source, arrays)
+    atomic_write_json(anchors_path, anchors)
     atomic_write_json(audit_file, audit)
     return len(fixes)
 
