@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MSECNet 法向修复</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#111319;color:#e6e9ef;font:14px system-ui,sans-serif}
+  #canvas{display:block;width:100vw;height:calc(100vh - 58px)}
+  #topbar{position:fixed;z-index:5;left:12px;right:clamp(260px,30vw,390px);top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px;background:#1a1e27ed;border:1px solid #444b5a;border-radius:6px}
+  label{display:flex;align-items:center;gap:5px;white-space:nowrap}
+  select,input,button{height:32px;background:#282e3a;border:1px solid #4c566a;border-radius:4px;color:#edf0f6;font:inherit}
+  select{max-width:310px;padding:0 7px}
+  input[type=number]{width:72px;padding:0 6px}
+  input[type=checkbox]{width:16px;height:16px;accent-color:#45a56c}
+  button{padding:0 10px;cursor:pointer}
+  button:hover{background:#394355}
+  button:disabled{opacity:.55;cursor:wait}
+  #run,#save{background:#236c45;border-color:#38955f}
+  #save:hover,#run:hover{background:#2b8053}
+  #job{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bdc8d9}
+  #info{position:fixed;z-index:3;left:12px;top:91px;min-width:280px;max-width:min(430px,calc(100vw - 24px));padding:9px 10px;background:#0b0d12d9;border:1px solid #333b4a;border-radius:5px;line-height:1.52;white-space:pre-wrap;user-select:text}
+  #tools{position:fixed;z-index:7;left:12px;top:224px;display:flex;flex-direction:column;gap:5px;width:165px;pointer-events:auto}
+  #tools button{text-align:left}
+  #rgbPanel{position:fixed;z-index:6;right:12px;top:12px;width:min(28vw,360px);padding:5px;background:#0b0d12e8;border:1px solid #3c4658;border-radius:5px}
+  #rgbPanel[hidden]{display:none}
+  #rgb{display:block;width:100%;max-height:46vh;object-fit:contain;background:#000;cursor:zoom-in}
+  #legend{position:fixed;z-index:6;right:12px;bottom:70px;padding:8px 10px;background:#0b0d12e8;border:1px solid #333b4a;border-radius:5px;color:#d9e0eb;font-size:12px;line-height:1.7}
+  #legend div{display:flex;align-items:center;gap:6px}.swatch{width:11px;height:11px;border-radius:50%;display:inline-block}.red{background:#ff4b60}.orange{background:#ffb13d}.cyan{background:#39cfe2}
+  #bottom{height:58px;display:flex;align-items:center;gap:7px;padding:0 12px;background:#181c24;border-top:1px solid #323946}
+  #status{margin-left:7px;color:#bfc8d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #loading{position:fixed;inset:0 0 58px;display:none;align-items:center;justify-content:center;z-index:10;background:#080a0c66;pointer-events:none}
+  #loading span{padding:10px 16px;background:#151922;border:1px solid #465064;border-radius:5px}
+  @media(max-width:840px){
+    #topbar{left:6px;right:6px;top:6px;gap:4px;padding:5px;font-size:12px;align-items:flex-start}
+    #topbar select{max-width:125px}
+    #split{width:50px}.topbar input[type=number],#threshold{width:58px}#run{padding:0 7px}
+    #job{display:none}
+    #info{top:99px;font-size:12px}
+    #tools{top:auto;bottom:70px;left:6px;right:auto;width:145px}
+    #rgbPanel{top:auto;bottom:70px;right:6px;width:min(46vw,260px)}
+    #rgb{max-height:31vh}
+    #legend{display:none}
+  }
+  @media(max-width:840px) and (max-height:600px){#tools{display:none}}
+</style>
+<script type="importmap">
+{"imports":{"three":"/vendor/three.module.js","three/addons/controls/OrbitControls.js":"/vendor/OrbitControls.js","three/addons/controls/TransformControls.js":"/vendor/TransformControls.js"}}
+</script>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="topbar">
+  <label>数据集 <select id="dataset"></select></label>
+  <label>权重 <select id="checkpoint"></select></label>
+  <label>划分 <select id="split"></select></label>
+  <label title="只保留预测与当前标签的误差严格大于阈值的样本"><input id="onlyAbove" type="checkbox" checked> 仅误差 &gt;</label>
+  <input id="threshold" type="number" min="0" step="0.1" value="5.0" aria-label="误差阈值（度）">
+  <span>°</span>
+  <button id="run">推理并载入</button>
+  <span id="job"></span>
+</div>
+<div id="info">选择权重、数据集和划分后开始推理。</div>
+<div id="tools">
+  <button id="displayMode" title="在模型实际输入和原始完整点云间切换">显示：模型输入</button>
+  <button id="viewFace" title="沿当前标签法向查看">正视盖面</button>
+  <button id="viewEdge" title="垂直当前标签法向查看">侧面检查</button>
+  <button id="reset" title="恢复本样本的原始标签">恢复原始标签</button>
+  <button id="pointSize" title="调整点云尺寸">点大小</button>
+  <button id="color" title="切换 RGB 与沿标签法向的高度配色">RGB 配色</button>
+</div>
+<div id="rgbPanel" hidden><img id="rgb" alt="当前样本源 RGB 图"></div>
+<div id="legend">
+  <div><span class="swatch red"></span><b>红色</b> 当前标签（可编辑）</div>
+  <div><span class="swatch orange"></span><b>橙色</b> 模型预测</div>
+  <div><span class="swatch cyan"></span><b>青色</b> 修改前标签</div>
+</div>
+<div id="bottom">
+  <button id="previous" title="A">上一个</button>
+  <button id="next" title="D">下一个</button>
+  <button id="save" title="Space">保存并下一个</button>
+  <span id="status"></span>
+</div>
+<div id="loading"><span>正在加载点云…</span></div>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {TransformControls} from 'three/addons/controls/TransformControls.js';
+
+const element=id=>document.getElementById(id);
+const canvas=element('canvas');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x111319);
+const camera=new THREE.PerspectiveCamera(45,1,.01,100); camera.position.set(0,0,2.4);
+const orbit=new OrbitControls(camera,renderer.domElement); orbit.enableDamping=true; orbit.dampingFactor=.08; orbit.minDistance=.55; orbit.maxDistance=8;
+scene.add(new THREE.GridHelper(3,12,0x354054,0x202631)); scene.add(new THREE.AxesHelper(.6));
+const pivot=new THREE.Object3D(); scene.add(pivot);
+const currentArrow=new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),1.35,0xff4b60,.22,.12); pivot.add(currentArrow);
+const predictionArrow=new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),1.6,0xffb13d,.24,.13); scene.add(predictionArrow);
+const baseArrow=new THREE.ArrowHelper(new THREE.Vector3(0,1,0),new THREE.Vector3(),1.1,0x39cfe2,.19,.1); scene.add(baseArrow);
+const discMat=new THREE.MeshBasicMaterial({color:0x3ba3ca,transparent:true,opacity:.25,side:THREE.DoubleSide,depthWrite:false});
+const disc=new THREE.Mesh(new THREE.CircleGeometry(.42,48).rotateX(-Math.PI/2),discMat); pivot.add(disc);
+const controls=new TransformControls(camera,renderer.domElement); controls.setMode('rotate'); controls.setSpace('local'); controls.setSize(.9); controls.attach(pivot); scene.add(controls);
+controls.addEventListener('dragging-changed',event=>{orbit.enabled=!event.value; if(event.value)pushUndo();});
+controls.addEventListener('objectChange',()=>{applyColor(); updateInfo();});
+let cloud=null, positionArray=null, rgbArray=null, current=null, index=0, count=0, pointSize=.012, colorMode='rgb', displayMode='input';
+const undo=[];
+function pushUndo(){undo.push(pivot.quaternion.clone()); if(undo.length>100)undo.shift();}
+function setNormal(normal){pivot.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),new THREE.Vector3(...normal).normalize());}
+function getNormal(){return new THREE.Vector3(0,1,0).applyQuaternion(pivot.quaternion).normalize();}
+function angle(a,b,axisOnly){const dot=Math.max(-1,Math.min(1,a.dot(b))); return THREE.MathUtils.radToDeg(Math.acos(axisOnly?Math.abs(dot):dot));}
+function applyColor(){
+  if(!cloud)return;
+  const colors=cloud.geometry.getAttribute('color');
+  if(colorMode==='rgb')colors.array.set(rgbArray);
+  else{
+    const normal=getNormal(); let min=Infinity,max=-Infinity; const heights=[];
+    for(let i=0;i<positionArray.length;i+=3){const value=positionArray[i]*normal.x+positionArray[i+1]*normal.y+positionArray[i+2]*normal.z; heights.push(value);min=Math.min(min,value);max=Math.max(max,value);}
+    for(let i=0;i<heights.length;i++){const t=(heights[i]-min)/(max-min+1e-9), color=new THREE.Color().setHSL((1-t)*.66,.85,.5); colors.array[3*i]=color.r;colors.array[3*i+1]=color.g;colors.array[3*i+2]=color.b;}
+  }
+  colors.needsUpdate=true;
+}
+function updateInfo(){
+  if(!current)return;
+  const normal=getNormal(), prediction=new THREE.Vector3(...current.model_label).normalize(), base=new THREE.Vector3(...current.base_normal).normalize();
+  const axisOnly=current.metric==='axis_error_deg';
+  const error=angle(normal,prediction,axisOnly), changed=angle(normal,base,axisOnly);
+  const metric=axisOnly?'轴角':'有向角';
+  element('info').textContent=`[${index+1}/${count}] ${current.file}\n${current.geometry}  点数 ${current.npts}${current.is_fixed?'  已修复':''}\n${metric}: 标签 ↔ 预测 ${error.toFixed(2)}°\n当前 ↔ 原始标签 ${changed.toFixed(2)}°\n标签 n=(${normal.x.toFixed(3)}, ${normal.y.toFixed(3)}, ${normal.z.toFixed(3)})`;
+  element('status').textContent=`队列 ${index+1}/${count}  |  ${metric} ${error.toFixed(2)}°`;
+}
+function readCloud(buffer){
+  const headerLength=new DataView(buffer).getUint32(0,true);
+  current=JSON.parse(new TextDecoder().decode(new Uint8Array(buffer,4,headerLength)));
+  const values=new Float32Array(buffer,4+headerLength), pointCount=values.length/6;
+  positionArray=new Float32Array(pointCount*3); rgbArray=new Float32Array(pointCount*3);
+  for(let i=0;i<pointCount;i++){const from=i*6,to=i*3;positionArray[to]=values[from];positionArray[to+1]=values[from+1];positionArray[to+2]=values[from+2];rgbArray[to]=values[from+3];rgbArray[to+1]=values[from+4];rgbArray[to+2]=values[from+5];}
+}
+async function load(nextIndex){
+  if(!count)return;
+  const clamped=Math.max(0,Math.min(nextIndex,count-1)); element('loading').style.display='flex';
+  try{
+    const response=await fetch(`/api/cloud/${clamped}?mode=${displayMode}`); if(!response.ok)throw new Error(await response.text());
+    readCloud(await response.arrayBuffer()); index=current.i; count=current.n; displayMode=current.display_mode; undo.length=0;
+    element('displayMode').textContent=displayMode==='input'?'显示：模型输入':'显示：全局点云';
+    if(cloud){scene.remove(cloud);cloud.geometry.dispose();cloud.material.dispose();}
+    const geometry=new THREE.BufferGeometry(); geometry.setAttribute('position',new THREE.BufferAttribute(positionArray,3)); geometry.setAttribute('color',new THREE.BufferAttribute(rgbArray.slice(),3));
+    cloud=new THREE.Points(geometry,new THREE.PointsMaterial({size:pointSize,vertexColors:true,sizeAttenuation:true})); scene.add(cloud);
+    setNormal(current.normal); predictionArrow.setDirection(new THREE.Vector3(...current.model_label).normalize()); baseArrow.setDirection(new THREE.Vector3(...current.base_normal).normalize()); applyColor(); updateRgb(); viewFace(); updateInfo();
+  }catch(error){element('info').textContent=`加载失败: ${error.message}`;}
+  finally{element('loading').style.display='none';}
+}
+function viewFace(){if(!current)return;camera.position.copy(getNormal().multiplyScalar(2.3));orbit.target.set(0,0,0);orbit.update();}
+function viewEdge(){if(!current)return;const normal=getNormal(),direction=new THREE.Vector3().crossVectors(normal,new THREE.Vector3(0,1,0));if(direction.length()<.001)direction.set(1,0,0);camera.position.copy(direction.normalize().multiplyScalar(2.4));orbit.target.set(0,0,0);orbit.update();}
+function updateRgb(){const panel=element('rgbPanel'), image=element('rgb');if(!current?.has_rgb){panel.hidden=true;image.removeAttribute('src');return;}image.src=`/api/rgb/${index}?t=${Date.now()}`;panel.hidden=false;image.onerror=()=>{panel.hidden=true;};}
+function toggleDisplayMode(){if(!current)return;displayMode=displayMode==='input'?'full':'input';element('displayMode').textContent=displayMode==='input'?'显示：模型输入':'显示：全局点云';load(index);}
+async function save(){
+  if(!current)return;
+  const response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:current.file,normal:getNormal().toArray()})});
+  const result=await response.json(); if(!response.ok||!result.ok){element('status').textContent=`保存失败: ${result.error||response.statusText}`;return;}
+  current.normal=getNormal().toArray(); current.error_deg=result.error_deg; element('status').textContent=`已保存 ${result.fixed_count} 条修复`; load(index+1);
+}
+function addOptions(select,items){select.textContent='';for(const item of items){const option=document.createElement('option');option.value=item.id;option.textContent=item.label;select.append(option);}}
+let options=null, loadedOutput='';
+const datasetSelect=element('dataset'), checkpointSelect=element('checkpoint'), splitSelect=element('split'), run=element('run'), jobText=element('job');
+function selectedDataset(){return options?.datasets.find(item=>item.id===datasetSelect.value);}
+function populateCheckpoints(){const dataset=selectedDataset();const compatible=(options?.checkpoints||[]).filter(item=>dataset?.model_types.includes(item.model_type));const before=checkpointSelect.value;addOptions(checkpointSelect,compatible);if(compatible.some(item=>item.id===before))checkpointSelect.value=before;run.disabled=!compatible.length;}
+function populateSplits(){const dataset=selectedDataset();addOptions(splitSelect,(dataset?.splits||[]).map(value=>({id:value,label:value})));}
+function renderJob(job){const last=(job.logs||[]).at(-1)||'';jobText.textContent=`${job.state||'idle'}${last?`: ${last}`:''}`;jobText.title=(job.logs||[]).join('\n');run.disabled=job.state==='running';}
+async function refreshQueue(){const response=await fetch('/api/meta');const meta=await response.json();count=meta.n||0;if(count)await load(0);else{current=null;element('info').textContent='当前筛选条件下没有待修复样本。';element('status').textContent='队列为空';}}
+async function pollJob(){try{const response=await fetch('/api/job'),job=await response.json();renderJob(job);if(job.state==='complete'&&job.output_dir!==loadedOutput){loadedOutput=job.output_dir;await refreshQueue();}if(job.state==='running')setTimeout(pollJob,1000);}catch(_) {setTimeout(pollJob,2000);}}
+async function rebuildQueue(){if(!loadedOutput)return;const response=await fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({only_above:element('onlyAbove').checked,threshold_deg:Number(element('threshold').value)})});const result=await response.json();if(!response.ok){jobText.textContent=`错误: ${result.error||response.statusText}`;return;}await refreshQueue();}
+async function setup(){
+  const response=await fetch('/api/options');options=await response.json();
+  if(!options.datasets.length||!options.checkpoints.length){element('info').textContent='没有找到可用的准备数据集或 checkpoint。';return;}
+  addOptions(datasetSelect,options.datasets);populateCheckpoints();populateSplits();
+  datasetSelect.onchange=()=>{populateCheckpoints();populateSplits();};
+  run.onclick=async()=>{loadedOutput='';const response=await fetch('/api/job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoint:checkpointSelect.value,dataset:datasetSelect.value,split:splitSelect.value,only_above:element('onlyAbove').checked,threshold_deg:Number(element('threshold').value)})});const job=await response.json();if(!response.ok){jobText.textContent=`错误: ${job.error||response.statusText}`;return;}renderJob(job);pollJob();};
+  element('onlyAbove').onchange=rebuildQueue;element('threshold').onchange=rebuildQueue;pollJob();
+}
+element('previous').onclick=()=>load(index-1);element('next').onclick=()=>load(index+1);element('save').onclick=save;element('displayMode').onclick=toggleDisplayMode;element('viewFace').onclick=viewFace;element('viewEdge').onclick=viewEdge;
+element('reset').onclick=()=>{if(!current)return;pushUndo();setNormal(current.base_normal);applyColor();updateInfo();};
+element('pointSize').onclick=()=>{pointSize=(pointSize>.02) ? .008 : pointSize*1.35;if(cloud)cloud.material.size=pointSize;};
+element('color').onclick=()=>{colorMode=colorMode==='rgb'?'height':'rgb';element('color').textContent=colorMode==='rgb'?'RGB 配色':'高度配色';applyColor();};
+addEventListener('keydown',event=>{
+  if(event.ctrlKey&&(event.key==='z'||event.key==='Z')){event.preventDefault();if(undo.length){pivot.quaternion.copy(undo.pop());applyColor();updateInfo();}return;}
+  if(event.code==='Space'){event.preventDefault();save();return;}if(event.key==='a')load(index-1);if(event.key==='d')load(index+1);if(event.key==='f')toggleDisplayMode();
+  const step=THREE.MathUtils.degToRad(event.shiftKey ? .1 : .5);let axis=null;
+  if(event.key==='ArrowUp')axis=new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);if(event.key==='ArrowDown')axis=new THREE.Vector3(-1,0,0).applyQuaternion(camera.quaternion);if(event.key==='ArrowLeft')axis=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);if(event.key==='ArrowRight')axis=new THREE.Vector3(0,0,1).applyQuaternion(camera.quaternion);
+  if(axis&&current){event.preventDefault();pushUndo();pivot.rotateOnWorldAxis(axis.normalize(),step);applyColor();updateInfo();}
+});
+function resize(){const width=innerWidth,height=innerHeight-58;renderer.setSize(width,height,false);camera.aspect=width/height;camera.updateProjectionMatrix();}
+addEventListener('resize',resize);resize();
+(function render(){requestAnimationFrame(render);orbit.update();renderer.render(scene,camera);})();
+setup();
+</script>
+</body>
+</html>
