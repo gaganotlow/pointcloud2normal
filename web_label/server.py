@@ -442,6 +442,12 @@ def available_evaluation_options():
             "label": f"8 cm ball: {path.parent.name}",
             "model_type": "center_ball",
         })
+    for path in sorted((project_root / "pointnet2_ball" / "out").glob("*/best.pt")):
+        checkpoints.append({
+            "id": str(path.relative_to(project_root)),
+            "label": f"PointNet++ 8 cm ball: {path.parent.name}",
+            "model_type": "pointnet2_ball",
+        })
 
     datasets = []
     source_candidates = list((project_root / "data").glob("fuelcap_pass_*"))
@@ -460,11 +466,11 @@ def available_evaluation_options():
             selection = next(iter(anchors.values()), {}).get("selection")
             if selection != "manual_center_ball_patch":
                 continue
-            model_type, model_types, split_path = "center_ball", ("center_ball",), split_by_group
+            model_type, model_types, split_path = "center_ball", ("center_ball", "pointnet2_ball"), split_by_group
         elif is_unlabeled:
             # A detector-derived OBB crop has no reviewed 3D center. The ball
             # predictor uses its crop centroid as the requested proxy center.
-            model_type, model_types, split_path = "pseudo_obb", ("pseudo_obb", "center_ball"), path / "split.json"
+            model_type, model_types, split_path = "pseudo_obb", ("pseudo_obb", "center_ball", "pointnet2_ball"), path / "split.json"
         else:
             continue
         manifest = [json.loads(line) for line in (path / "manifest.jsonl").read_text(encoding="utf-8").splitlines() if line]
@@ -489,7 +495,7 @@ def available_evaluation_options():
                 "model_types": list(model_types),
             })
     supported_model_types = {item["model_type"] for item in checkpoints}
-    datasets = [item for item in datasets if item["model_type"] in supported_model_types]
+    datasets = [item for item in datasets if set(item.get("model_types", (item["model_type"],))) & supported_model_types]
     return {"checkpoints": checkpoints, "datasets": datasets}
 
 
@@ -571,11 +577,12 @@ def start_msecnet_job():
     dataset_dir = Path(ROOT) / "data" / dataset_id
     source_root = Path(dataset["source_root"]) if dataset["source_root"] else dataset_dir
     output_dir = checkpoint.parent / "web_inference" / dataset_id / split_name
-    if dataset["kind"] == "unlabeled" and checkpoint_type == "center_ball":
+    if dataset["kind"] == "unlabeled" and checkpoint_type in ("center_ball", "pointnet2_ball"):
         if not dataset["source_root"]:
             return jsonify({"error": "ball inference needs the original source-cloud directory"}), 400
+        script = "msecnet_ball/predict_unlabeled.py" if checkpoint_type == "center_ball" else "pointnet2_ball/predict_unlabeled.py"
         command = [
-            sys.executable, "-u", str(Path(ROOT) / "msecnet_ball" / "predict_unlabeled.py"),
+            sys.executable, "-u", str(Path(ROOT) / script),
             str(checkpoint), str(dataset_dir), "--source-root", str(source_root), "--out", str(output_dir),
         ]
     elif dataset["kind"] == "unlabeled":
@@ -586,6 +593,14 @@ def start_msecnet_job():
     elif checkpoint_type == "center_ball":
         command = [
             sys.executable, "-u", str(Path(ROOT) / "msecnet_ball" / "infer.py"),
+            str(checkpoint), str(dataset_dir / "labels_manual3d.npz"), str(dataset_dir / "clouds"),
+            "--centers", str(dataset_dir / "anchors_manual3d.json"),
+            "--split", str(dataset_dir / "split_by_generalization_group.json"),
+            "--split-name", split_name, "--out", str(output_dir),
+        ]
+    elif checkpoint_type == "pointnet2_ball":
+        command = [
+            sys.executable, "-u", str(Path(ROOT) / "pointnet2_ball" / "infer.py"),
             str(checkpoint), str(dataset_dir / "labels_manual3d.npz"), str(dataset_dir / "clouds"),
             "--centers", str(dataset_dir / "anchors_manual3d.json"),
             "--split", str(dataset_dir / "split_by_generalization_group.json"),

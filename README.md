@@ -1,11 +1,12 @@
 # point2normal 使用手册
 
-本仓库有三个**并列**的训练任务。它们都只使用最新的
+本仓库有四个**并列**的训练任务。它们都只使用最新的
 `data/fuelcap_pass_20260803_10847/`，各自训练、评估并保存 checkpoint；没有哪个任务是“附属功能”。
 
 | 任务 | 目录 | 要解决的问题 | 输入 | 评价 |
 | --- | --- | --- | --- | --- |
 | 8 cm 球形点云 | `msecnet_ball/` | 人工指定盖中心的朝相机法向 | 中心周围 8 cm 球形点云 | 有向 `angular_error_deg` |
+| PointNet++ 球形点云 | `pointnet2_ball/` | 同一中心法向的单向量回归基线 | 同一中心周围球形点云（当前有 r08/r05） | 有向 `angular_error_deg` |
 | RGB + 球形点云 | `msecnet_ball_addRGB/` | 同一中心法向，结合原图视觉信息 | 8 cm 球形点云 + OBB RGB crop | 有向 `angular_error_deg` |
 | 人工伪 OBB | `msecnet_best/` | 历史 MSECNet 局部平面法向基线 | 人工矩形定义的薄点云棱柱 | 无向 `axis_error_deg` |
 
@@ -20,7 +21,7 @@ cd /data2/shendu/code/ruoyu/train_point2normal
 conda run --no-capture-output -n point2normal python <脚本> <参数>
 ```
 
-三个任务共用 `msecnet_best/MSECNet/` 中的 pointops CUDA 扩展。首次配置环境时编译一次：
+MSECNet 与 RGB 融合任务共用 `msecnet_best/MSECNet/` 中的 pointops CUDA 扩展。PointNet++ ball 基线使用标准 PyTorch 操作，不需要编译该扩展。首次配置 MSECNet 环境时编译一次：
 
 ```bash
 (
@@ -38,11 +39,12 @@ conda run --no-capture-output -n point2normal python <脚本> <参数>
 data/fuelcap_pass_20260803_10847/
 ```
 
-它包含 10,847 个审核通过样本、145 个车型。旧 9211 及更早数据集只保留作历史追溯，不能参与当前训练。三个训练脚本会检查派生集 `dataset.json` 的 `source_dataset`，并拒绝旧集或混合的 labels、clouds、anchors、split 路径。
+它包含 10,847 个审核通过样本、145 个车型。旧 9211 及更早数据集只保留作历史追溯，不能参与当前训练。四个训练脚本会检查派生集 `dataset.json` 的 `source_dataset`，并拒绝旧集或混合的 labels、clouds、anchors、split 路径。
 
 | 派生集 | 样本与切分 | 供哪个任务使用 |
 | --- | --- | --- |
-| `msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08` | 10,846；train 8,676 / val 1,085 / test 1,085 | 8 cm 球形点云、RGB + 球形点云 |
+| `msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08` | 10,846；train 8,676 / val 1,085 / test 1,085 | MSECNet 8 cm 球形点云、PointNet++ 8 cm 球形点云、RGB + 球形点云 |
+| `msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r05` | 10,846；与 r08 完全相同 split | PointNet++ 5 cm 球形点云（由当前修复后的 r08 派生） |
 | `msecnet_best_fuelcap_pass_20260803_10847_manual3d_pseudo_obb` | 10,826；train 8,635 / val 1,103 / test 1,088 | 人工伪 OBB |
 
 每个派生集的 `manifest.jsonl` 用于回溯原始样本，`split_*.json` 是唯一有效的 train/val/test 划分。不要随机重切帧，也不要覆盖当前目录；修改裁剪参数时创建新的输出目录，并重新生成 `dataset.json`。
@@ -97,7 +99,42 @@ conda run --no-capture-output -n point2normal python msecnet_ball/infer.py \
 
 产物位于 `msecnet_ball/out/center_ball_r08_oriented_20260803_v1/`：`best.pt`、`last.pt`、`metrics.csv`、`dashboard.png`、`run.json` 和 `inference_test/report.json`。
 
-## 4. 任务二：RGB + 球形点云
+## 4. 任务二：PointNet++ 球形点云
+
+**目标：** 使用与 MSECNet ball 完全相同的人工球心、球形点云、标签和车型泛化切分，但直接从整团点云回归一个朝相机的法向量。当前同时维护 r08（8 cm）和 r05（5 cm）两种输入半径；checkpoint 会记录并自动使用对应半径。
+
+**模型：** 两层 PointNet++ Set Abstraction（FPS + kNN 分组 + 共享 MLP）提取局部几何，随后全局 max pooling 和三维回归头输出一个单位法向。它不使用 MSECNet 的“每点预测、再聚合”路径，因此是排查模型归纳偏置与标注长尾的独立基线。
+
+### 训练
+
+```bash
+conda run --no-capture-output -n point2normal python \
+  pointnet2_ball/train.py \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/labels_manual3d.npz \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/clouds \
+  --centers data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/anchors_manual3d.json \
+  --split data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/split_by_generalization_group.json \
+  --ball-radius-m 0.08 --num-points 1024 --aug-deg 45 \
+  --steps 70000 --batch-size 24 --lr 3e-4 --ema-decay 0.995 --grad-clip 1.0 --seed 20260722 \
+  --out pointnet2_ball/out/pointnet2_ball_r08_oriented_20260803_v1
+```
+
+### 评估
+
+```bash
+conda run --no-capture-output -n point2normal python \
+  pointnet2_ball/infer.py \
+  pointnet2_ball/out/pointnet2_ball_r08_oriented_20260803_v1/best.pt \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/labels_manual3d.npz \
+  data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/clouds \
+  --centers data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/anchors_manual3d.json \
+  --split data/msecnet_ball_v1_fuelcap_pass_20260803_10847_manual3d_r08/split_by_generalization_group.json \
+  --split-name test
+```
+
+详见 [pointnet2_ball/README.md](pointnet2_ball/README.md)。
+
+## 5. 任务三：RGB + 球形点云
 
 **目标：** 回归与任务一相同的有向法向，同时让原图 RGB 为点云几何提供补充信息。
 
@@ -156,7 +193,7 @@ conda run --no-capture-output -n point2normal python \
 
 产物位于 `msecnet_ball_addRGB/out/rgb_fusion_dino_obb_20260803_v1/`：`best.pt`、`last.pt`、`metrics.csv`、`dashboard.png`、`run.json` 和 `inference_test/report.json`。评估时同时查看融合、纯几何和纯 RGB 的预测，不要只看融合均值。
 
-## 5. 任务三：人工伪 OBB
+## 6. 任务四：人工伪 OBB
 
 **目标：** 复现并维护历史 MSECNet 局部平面基线，回归法向轴而非有方向的法向量。
 
@@ -201,7 +238,7 @@ conda run --no-capture-output -n point2normal python msecnet_best/infer.py \
 
 产物位于 `msecnet_best/out/pseudo_obb_20260803_v1/`：`best.pt`、`last.pt`、`snapshots/`、`metrics.csv`、`dashboard.png`、`run.json` 和 `inference_test/report.json`。
 
-## 6. 共享工具
+## 7. 共享工具
 
 ### 开放集预测
 
@@ -213,23 +250,23 @@ conda run --no-capture-output -n point2normal python msecnet_best/infer.py \
 bash shell/launch_msecnet_test_viewer.sh 8765
 ```
 
-打开 `http://127.0.0.1:8765` 后，选择已完成 checkpoint、匹配的派生集和 split。Web UI 支持伪 OBB 与单模态球形任务；RGB 融合请使用其 `infer.py` 生成报告。
+打开 `http://127.0.0.1:8765` 后，选择已完成 checkpoint、匹配的派生集和 split。Web UI 支持伪 OBB、MSECNet ball 与 PointNet++ ball；RGB 融合请使用其 `infer.py` 生成报告。
 
 ### 法向标签修复 Web
 
-对 `train` 或 `val` 做权重推理后，可以在同一页面直接复核并调整人工法向：
+对 `train`、`val` 或 `test` 做权重推理后，可以在同一页面直接复核并调整人工法向：
 
 ```bash
 bash shell/launch_fix_normal.sh 8766
 ```
 
-打开 `http://127.0.0.1:8766`，选择权重、匹配的准备数据集和 `train`/`val`，再点“推理并载入”。默认只排入“预测与当前标签的误差**大于** 5°”的样本；取消筛选或修改阈值后无需重复推理。红箭头是可编辑的当前标签，橙箭头是预测，青箭头是原始标签；拖动红色旋转环或用方向键微调，按空格保存并进入下一条。左侧“显示：模型输入”可切换到该样本的全局原始点云，右上角同步显示源 RGB 图。
+打开 `http://127.0.0.1:8766`，选择权重、匹配的准备数据集和划分，再点“推理并载入”。默认只排入“预测与当前标签的误差**大于** 5°”的样本；取消筛选或修改阈值后无需重复推理。红箭头是可编辑的当前标签，橙箭头是预测，青箭头是原始标签；拖动红色旋转环或用方向键微调，按空格保存并进入下一条。左侧“显示：模型输入”可切换到该样本的全局原始点云，右上角同步显示源 RGB 图。`test` 适合定位报告中的长尾，但保存 test 修正会改变评估基准，页面会明确标记并在 `normal_fixes.json` 中记录。
 
 保存会在一次操作中同步更新所选派生训练集中的 `labels_manual3d.npz` 与 `anchors_manual3d.json`：后者的 `normal`、`tangent` 和 `pose_T` 会重建为同一个正交坐标系，避免两份标签再次漂移。训练和后续推理会立刻使用新标签；每个文件均以原子替换写入。修复应用还会更新：
 
 - `normal_fixes.json`：记录原始/上一次/修复后法向、推理预测、当时误差、权重、报告、划分和保存时间。
 
-页面重新推理和三个训练脚本都直接读取这个被修复后的 `labels_manual3d.npz`，并仍只接受 20260803 的 clouds、anchors、split 与原始数据源。
+页面重新推理和四个训练脚本都直接读取这个被修复后的 `labels_manual3d.npz`，并仍只接受 20260803 的 clouds、anchors、split 与原始数据源。
 
 ### PLY 与 ONNX
 

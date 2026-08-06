@@ -210,7 +210,7 @@ def prepared_datasets() -> list[dict]:
         model_types = []
         if (dataset_dir / "split_by_generalization_group.json").is_file():
             split_path = dataset_dir / "split_by_generalization_group.json"
-            model_types = ["center_ball", "rgb_ball"]
+            model_types = ["center_ball", "pointnet2_ball", "rgb_ball"]
         elif (dataset_dir / "split_by_car_model.json").is_file():
             split_path = dataset_dir / "split_by_car_model.json"
             model_types = ["pseudo_obb"]
@@ -221,7 +221,10 @@ def prepared_datasets() -> list[dict]:
             manifest = [json.loads(line) for line in (dataset_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines() if line]
         except (OSError, json.JSONDecodeError):
             continue
-        splits = [name for name in ("train", "val") if split.get(name)]
+        # Test is intentionally available for diagnosis of reported long-tail
+        # cases. Saving there changes the evaluation reference, so the UI marks
+        # the split and keeps it in the per-sample audit record.
+        splits = [name for name in ("train", "val", "test") if split.get(name)]
         if not manifest or not splits:
             continue
         source_dataset = ""
@@ -253,17 +256,32 @@ def prepared_datasets() -> list[dict]:
 
 
 def available_checkpoints() -> list[dict]:
+    def radius_label(path: Path, fallback: str) -> str:
+        metadata_path = path.parent / "run.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            radius = float(metadata.get("ball_radius_m"))
+            if radius > 0:
+                return f"{radius * 100:g} cm 球形点云"
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return fallback
+
     checkpoints = []
     specs = (
         ("msecnet_ball", "center_ball", "8 cm 球形点云"),
+        ("pointnet2_ball", "pointnet2_ball", "PointNet++ 球形点云"),
         ("msecnet_ball_addRGB", "rgb_ball", "RGB + 球形点云"),
         ("msecnet_best", "pseudo_obb", "人工伪 OBB"),
     )
     for directory, model_type, prefix in specs:
         for path in sorted((ROOT / directory / "out").glob("*/best.pt")):
+            display_prefix = prefix
+            if model_type == "pointnet2_ball":
+                display_prefix = f"PointNet++ {radius_label(path, prefix)}"
             checkpoints.append({
                 "id": str(path.relative_to(ROOT)),
-                "label": f"{prefix}: {path.parent.name}",
+                "label": f"{display_prefix}: {path.parent.name}",
                 "model_type": model_type,
             })
     return checkpoints
@@ -552,6 +570,12 @@ def inference_command(checkpoint: dict, dataset: dict, split_name: str) -> tuple
             "--centers", str(anchors_path), "--split", str(split_path), "--split-name", split_name,
             "--out", str(output_dir),
         ]
+    elif checkpoint["model_type"] == "pointnet2_ball":
+        command = base + [
+            str(ROOT / "pointnet2_ball" / "infer.py"), str(checkpoint_path), str(labels_path), str(dataset_dir / "clouds"),
+            "--centers", str(anchors_path), "--split", str(split_path), "--split-name", split_name,
+            "--out", str(output_dir),
+        ]
     elif checkpoint["model_type"] == "pseudo_obb":
         command = base + [
             str(ROOT / "msecnet_best" / "infer.py"), str(checkpoint_path), str(labels_path), str(dataset_dir / "clouds"),
@@ -613,6 +637,7 @@ def cloud_response(item: dict, index: int) -> Response:
     with STATE_LOCK:
         dataset = STATE["dataset"]
         model_type = STATE["model_type"]
+        split_name = STATE["split"]
         asset = STATE["source_assets"].get(item["file"])
         queue_length = len(STATE["items"])
     if not dataset or not model_type:
@@ -641,7 +666,7 @@ def cloud_response(item: dict, index: int) -> Response:
         point_mask = input_label == 1
         xyz = input_xyz[point_mask] if point_mask.any() else input_xyz
         rgb = input_rgb[point_mask] if input_rgb is not None and point_mask.any() else input_rgb
-        if model_type in ("center_ball", "rgb_ball") and "center_3d" in anchor:
+        if model_type in ("center_ball", "pointnet2_ball", "rgb_ball") and "center_3d" in anchor:
             center = np.asarray(anchor["center_3d"], dtype=np.float32)
             radius = float(anchor.get("ball_radius_m", DISPLAY_BALL_RADIUS_M))
             ball_mask = np.linalg.norm(xyz - center, axis=1) <= radius
@@ -689,6 +714,8 @@ def cloud_response(item: dict, index: int) -> Response:
         "has_rgb": source_image_path(dataset, asset) is not None,
         "is_fixed": not np.allclose(target, base_normal, atol=1e-7),
         "model_type": model_type,
+        "car_model": item.get("row", {}).get("car_model", ""),
+        "split": split_name or "",
     }
     packed = np.empty((len(points), 6), dtype=np.float32)
     packed[:, :3] = points
@@ -731,8 +758,8 @@ def start_job():
     try:
         threshold_deg = float(payload.get("threshold_deg", DEFAULT_THRESHOLD_DEG))
         checkpoint, dataset = find_option(available_options(), checkpoint_id, dataset_id)
-        if split_name not in dataset["splits"] or split_name not in ("train", "val"):
-            raise ValueError("修复模式只允许 train 或 val 划分")
+        if split_name not in dataset["splits"] or split_name not in ("train", "val", "test"):
+            raise ValueError("无效的划分；请选择 train、val 或 test")
         if threshold_deg < 0 or not np.isfinite(threshold_deg):
             raise ValueError("角度阈值必须是非负有限数")
         command, report_path, _ = inference_command(checkpoint, dataset, split_name)

@@ -62,11 +62,12 @@
   <button id="run">推理并载入</button>
   <span id="job"></span>
 </div>
-<div id="info">选择权重、数据集和划分后开始推理。</div>
+<div id="info">选择权重、数据集和划分后开始推理。测试集仅用于定位长尾；保存测试集修正会改变该评估基准。</div>
 <div id="tools">
   <button id="displayMode" title="在模型实际输入和原始完整点云间切换">显示：模型输入</button>
   <button id="viewFace" title="沿当前标签法向查看">正视盖面</button>
   <button id="viewEdge" title="垂直当前标签法向查看">侧面检查</button>
+  <button id="alignPrediction" title="将当前标签直接对齐到橙色模型预测，可用 Ctrl+Z 撤销">对齐模型预测</button>
   <button id="reset" title="恢复本样本的原始标签">恢复原始标签</button>
   <button id="pointSize" title="调整点云尺寸">点大小</button>
   <button id="color" title="切换 RGB 与沿标签法向的高度配色">RGB 配色</button>
@@ -129,7 +130,8 @@ function updateInfo(){
   const axisOnly=current.metric==='axis_error_deg';
   const error=angle(normal,prediction,axisOnly), changed=angle(normal,base,axisOnly);
   const metric=axisOnly?'轴角':'有向角';
-  element('info').textContent=`[${index+1}/${count}] ${current.file}\n${current.geometry}  点数 ${current.npts}${current.is_fixed?'  已修复':''}\n${metric}: 标签 ↔ 预测 ${error.toFixed(2)}°\n当前 ↔ 原始标签 ${changed.toFixed(2)}°\n标签 n=(${normal.x.toFixed(3)}, ${normal.y.toFixed(3)}, ${normal.z.toFixed(3)})`;
+  const splitWarning=current.split==='test'?'\n⚠ TEST：保存会改变评估基准':'';
+  element('info').textContent=`[${index+1}/${count}] ${current.file}\n车型: ${current.car_model||'未知'}  划分: ${current.split||'未知'}${splitWarning}\n${current.geometry}  点数 ${current.npts}${current.is_fixed?'  已修复':''}\n${metric}: 标签 ↔ 预测 ${error.toFixed(2)}°\n当前 ↔ 原始标签 ${changed.toFixed(2)}°\n标签 n=(${normal.x.toFixed(3)}, ${normal.y.toFixed(3)}, ${normal.z.toFixed(3)})`;
   element('status').textContent=`队列 ${index+1}/${count}  |  ${metric} ${error.toFixed(2)}°`;
 }
 function readCloud(buffer){
@@ -182,6 +184,14 @@ async function setup(){
   element('onlyAbove').onchange=rebuildQueue;element('threshold').onchange=rebuildQueue;pollJob();
 }
 element('previous').onclick=()=>load(index-1);element('next').onclick=()=>load(index+1);element('save').onclick=save;element('displayMode').onclick=toggleDisplayMode;element('viewFace').onclick=viewFace;element('viewEdge').onclick=viewEdge;
+element('alignPrediction').onclick=()=>{
+  if(!current)return;
+  pushUndo();
+  setNormal(current.model_label);
+  applyColor();
+  updateInfo();
+  element('status').textContent='已将当前标签对齐到模型预测；点击“保存并下一个”写入数据';
+};
 element('reset').onclick=()=>{if(!current)return;pushUndo();setNormal(current.base_normal);applyColor();updateInfo();};
 element('pointSize').onclick=()=>{pointSize=(pointSize>.02) ? .008 : pointSize*1.35;if(cloud)cloud.material.size=pointSize;};
 element('color').onclick=()=>{colorMode=colorMode==='rgb'?'height':'rgb';element('color').textContent=colorMode==='rgb'?'RGB 配色':'高度配色';applyColor();};

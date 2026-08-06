@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve the train/validation normal-label repair UI.
+# Serve the train/validation/test normal-label repair UI.
 set -euo pipefail
 
 PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
